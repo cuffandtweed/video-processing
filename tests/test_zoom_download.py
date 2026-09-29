@@ -123,3 +123,54 @@ def test_client_raises_after_max_429_retries():
     client = zd.ZoomClient(auth, session=sess, sleep=lambda s: None, max_retries=3)
     with pytest.raises(RuntimeError):
         client.request("GET", "https://api.zoom.us/v2/x")
+
+
+# ---- Task 3: listing --------------------------------------------------------
+class FakeClient:
+    """Stands in for ZoomClient: serves queued responses and records params."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+
+    def request(self, method, url, **kw):
+        self.requests.append((method, url, kw.get("params")))
+        return self.responses.pop(0)
+
+
+def mp4(fid, status="completed", url=None):
+    return {"id": fid, "file_type": "MP4", "status": status,
+            "download_url": url or f"https://zoom.us/rec/download/{fid}", "file_size": 1000}
+
+
+def m4a(fid):
+    return {"id": fid, "file_type": "M4A", "status": "completed",
+            "download_url": f"https://zoom.us/rec/download/{fid}", "file_size": 10}
+
+
+def meeting(mid, topic, files, start="2026-07-05T15:00:00Z"):
+    return {"id": mid, "topic": topic, "start_time": start, "recording_files": files}
+
+
+def test_iter_recordings_pages_through_windows_and_filters():
+    client = FakeClient([
+        FakeResp(200, {"next_page_token": "abc", "meetings": [meeting(1, "Kickoff", [mp4("f1"), m4a("f2")])]}),
+        FakeResp(200, {"next_page_token": "", "meetings": [meeting(2, "Weekly", [mp4("f3", status="processing"), mp4("f4")])]}),
+        FakeResp(200, {"meetings": []}),  # second date window
+    ])
+    items = list(zd.iter_recordings(client, date(2026, 7, 1), date(2026, 7, 31)))
+    assert [i["file_id"] for i in items] == ["f1", "f4"]
+    assert items[0] == {"meeting_id": 1, "topic": "Kickoff", "start_time": "2026-07-05T15:00:00Z",
+                        "file_id": "f1", "download_url": "https://zoom.us/rec/download/f1", "size": 1000}
+    # three requests: window 1 page 1, window 1 page 2 (with token), window 2 page 1
+    assert len(client.requests) == 3
+    assert client.requests[0][1] == "https://api.zoom.us/v2/users/me/recordings"
+    assert client.requests[0][2] == {"from": "2026-07-01", "to": "2026-07-30", "page_size": 300}
+    assert client.requests[1][2] == {"from": "2026-07-01", "to": "2026-07-30", "page_size": 300, "next_page_token": "abc"}
+    assert client.requests[2][2] == {"from": "2026-07-31", "to": "2026-07-31", "page_size": 300}
+
+
+def test_iter_recordings_uses_given_user():
+    client = FakeClient([FakeResp(200, {"meetings": []})])
+    list(zd.iter_recordings(client, date(2026, 7, 1), date(2026, 7, 2), user="liz@example.com"))
+    assert client.requests[0][1] == "https://api.zoom.us/v2/users/liz@example.com/recordings"

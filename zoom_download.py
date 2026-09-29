@@ -95,3 +95,28 @@ class ZoomClient:
             r.raise_for_status()
             return r
         raise RuntimeError(f"Gave up after {self.max_retries} attempts: {url}")
+
+
+def iter_recordings(client, start, end, user="me"):
+    """Yield one dict per completed MP4, walking date windows and result pages."""
+    for w_start, w_end in date_windows(start, end):
+        token = None
+        while True:
+            params = {"from": w_start.isoformat(), "to": w_end.isoformat(), "page_size": 300}
+            if token:
+                params["next_page_token"] = token
+            body = client.request("GET", f"{API}/users/{user}/recordings", params=params).json()
+            for m in body.get("meetings", []):
+                for f in m.get("recording_files", []):
+                    if f.get("file_type") == "MP4" and f.get("status") == "completed":
+                        yield {
+                            "meeting_id": m["id"],
+                            "topic": m.get("topic", ""),
+                            "start_time": m["start_time"],
+                            "file_id": f["id"],
+                            "download_url": f["download_url"],
+                            "size": f.get("file_size", 0),
+                        }
+            token = body.get("next_page_token") or None
+            if not token:
+                break

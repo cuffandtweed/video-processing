@@ -220,3 +220,78 @@ def test_key_exists_true_false_and_reraises_other_errors():
 
     with pytest.raises(ClientError):
         zd.key_exists(Denied(), "b", "a.mp4")
+
+
+# ---- Task 5: process loop -----------------------------------------------------
+import boto3.exceptions
+
+
+def item(mid, topic="Call", start="2026-07-05T15:00:00Z", fid="f", size=3):
+    return {"meeting_id": mid, "topic": topic, "start_time": start, "file_id": fid,
+            "download_url": f"https://zoom.us/rec/download/{fid}", "size": size}
+
+
+class DownloadClient:
+    """Serves file bytes by URL; a URL mapped to an Exception raises it."""
+
+    def __init__(self, files):
+        self.files = files
+        self.seen = []
+
+    def request(self, method, url, **kw):
+        self.seen.append((method, url, kw))
+        data = self.files[url]
+        if isinstance(data, Exception):
+            raise data
+        return FakeResp(200, chunks=[data[:2], data[2:]])
+
+
+def test_process_all_downloads_uploads_and_cleans_up(tmp_path):
+    s3 = FakeS3()
+    client = DownloadClient({"https://zoom.us/rec/download/f1": b"abc"})
+    result = zd.process_all([item(1, fid="f1")], client, s3, "bkt", tmpdir=str(tmp_path), log=lambda m: None)
+    assert result == {"uploaded": 1, "skipped": 0, "failures": []}
+    assert s3.uploads == [("2026-07-05_call_1.mp4", b"abc")]
+    assert list(tmp_path.iterdir()) == []
+    assert client.seen[0][2] == {"stream": True}
+
+
+def test_process_all_skips_existing_without_downloading(tmp_path):
+    s3 = FakeS3(existing={"2026-07-05_call_1.mp4"})
+    client = DownloadClient({})
+    result = zd.process_all([item(1, fid="f1")], client, s3, "bkt", tmpdir=str(tmp_path), log=lambda m: None)
+    assert result == {"uploaded": 0, "skipped": 1, "failures": []}
+    assert client.seen == []
+
+
+def test_process_all_records_failure_and_continues(tmp_path):
+    s3 = FakeS3()
+    client = DownloadClient({
+        "https://zoom.us/rec/download/f1": requests.HTTPError("500"),
+        "https://zoom.us/rec/download/f2": b"xyz",
+    })
+    result = zd.process_all([item(1, fid="f1"), item(2, fid="f2")], client, s3, "bkt",
+                            tmpdir=str(tmp_path), log=lambda m: None)
+    assert result["uploaded"] == 1
+    assert [k for k, _ in result["failures"]] == ["2026-07-05_call_1.mp4"]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_process_all_numbers_second_mp4_on_same_meeting(tmp_path):
+    s3 = FakeS3()
+    client = DownloadClient({"https://zoom.us/rec/download/a": b"aaa", "https://zoom.us/rec/download/b": b"bbb"})
+    zd.process_all([item(1, fid="a"), item(1, fid="b")], client, s3, "bkt", tmpdir=str(tmp_path), log=lambda m: None)
+    assert [k for k, _ in s3.uploads] == ["2026-07-05_call_1.mp4", "2026-07-05_call_1_1.mp4"]
+
+
+def test_process_all_aborts_on_expired_aws_credentials(tmp_path):
+    class ExpiredS3(FakeS3):
+        def upload_file(self, path, bucket, key):
+            raise boto3.exceptions.S3UploadFailedError("An error occurred (ExpiredToken) when calling PutObject")
+
+    client = DownloadClient({"https://zoom.us/rec/download/f1": b"abc", "https://zoom.us/rec/download/f2": b"abc"})
+    with pytest.raises(zd.AwsCredentialsError):
+        zd.process_all([item(1, fid="f1"), item(2, fid="f2")], client, ExpiredS3(), "bkt",
+                       tmpdir=str(tmp_path), log=lambda m: None)
+    assert list(tmp_path.iterdir()) == []
+    assert len(client.seen) == 1  # stopped after the first file

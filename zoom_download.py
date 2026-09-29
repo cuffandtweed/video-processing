@@ -141,3 +141,57 @@ def key_exists(s3, bucket, key):
         if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
             return False
         raise
+
+
+class AwsCredentialsError(Exception):
+    """AWS credentials are missing or expired; every later file would fail the same way."""
+
+
+def _is_aws_auth_error(e):
+    if isinstance(e, NoCredentialsError):
+        return True
+    text = str(e)
+    return any(s in text for s in ("ExpiredToken", "InvalidToken", "TokenRefreshRequired", "InvalidAccessKeyId"))
+
+
+def download_to(client, url, path, chunk=1 << 20):
+    """Stream a Zoom file to `path` without holding it in memory."""
+    r = client.request("GET", url, stream=True)
+    try:
+        with open(path, "wb") as f:
+            for part in r.iter_content(chunk_size=chunk):
+                f.write(part)
+    finally:
+        r.close()
+
+
+def process_all(items, client, s3, bucket, tmpdir=None, log=print):
+    """One file at a time: skip if in S3, else download, upload, delete the temp file."""
+    uploaded = skipped = 0
+    failures = []
+    parts = {}
+    for it in items:
+        n = parts.get(it["meeting_id"], 0)
+        parts[it["meeting_id"]] = n + 1
+        key = make_key(it, n)
+        try:
+            if key_exists(s3, bucket, key):
+                log(f"skip (already in S3): {key}")
+                skipped += 1
+                continue
+            fd, path = tempfile.mkstemp(suffix=".mp4", dir=tmpdir)
+            os.close(fd)
+            try:
+                log(f"downloading: {key} ({it['size'] / 1e6:.1f} MB)")
+                download_to(client, it["download_url"], path)
+                s3.upload_file(path, bucket, key)
+            finally:
+                os.remove(path)
+            log(f"uploaded: {key}")
+            uploaded += 1
+        except Exception as e:
+            if _is_aws_auth_error(e):
+                raise AwsCredentialsError(f"AWS credentials missing or expired: {e}") from e
+            log(f"FAILED: {key}: {e}")
+            failures.append((key, str(e)))
+    return {"uploaded": uploaded, "skipped": skipped, "failures": failures}

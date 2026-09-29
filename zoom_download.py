@@ -195,3 +195,54 @@ def process_all(items, client, s3, bucket, tmpdir=None, log=print):
             log(f"FAILED: {key}: {e}")
             failures.append((key, str(e)))
     return {"uploaded": uploaded, "skipped": skipped, "failures": failures}
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Download Zoom MP4 recordings one at a time and upload them to S3.")
+    p.add_argument("--bucket", default=DEFAULT_BUCKET)
+    p.add_argument("--region", default=DEFAULT_REGION)
+    p.add_argument("--from", dest="start", type=date.fromisoformat, default=DEFAULT_FROM,
+                   help="first day to include, YYYY-MM-DD (default 2026-07-01)")
+    p.add_argument("--to", dest="end", type=date.fromisoformat, default=None,
+                   help="last day to include, YYYY-MM-DD (default today)")
+    p.add_argument("--user", default="me", help="Zoom user id or email whose recordings to list (default: me)")
+    p.add_argument("--limit", type=int, default=None, help="stop after N files (for testing)")
+    p.add_argument("--list-only", action="store_true", help="list matching recordings, download nothing")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    missing = [v for v in ("ZOOM_ACCOUNT_ID", "ZOOM_CLIENT_ID", "ZOOM_CLIENT_SECRET") if not os.environ.get(v)]
+    if missing:
+        sys.exit("Missing environment variables: " + ", ".join(missing))
+
+    end = args.end or date.today()
+    auth = ZoomAuth(os.environ["ZOOM_ACCOUNT_ID"], os.environ["ZOOM_CLIENT_ID"], os.environ["ZOOM_CLIENT_SECRET"])
+    client = ZoomClient(auth)
+    items = iter_recordings(client, args.start, end, user=args.user)
+    if args.limit is not None:
+        items = itertools.islice(items, args.limit)
+
+    if args.list_only:
+        count = 0
+        for it in items:
+            print(f"{make_key(it)}  ({it['size'] / 1e6:.1f} MB)")
+            count += 1
+        print(f"{count} recording(s) match {args.start} .. {end}")
+        return 0
+
+    s3 = boto3.client("s3", region_name=args.region)
+    try:
+        result = process_all(items, client, s3, args.bucket)
+    except AwsCredentialsError as e:
+        print(f"\nStopped: {e}\nRefresh with:  aws sso login --profile <your profile>")
+        return 1
+    print(f"\nDone: {result['uploaded']} uploaded, {result['skipped']} skipped, {len(result['failures'])} failed")
+    for key, err in result["failures"]:
+        print(f"  FAILED {key}: {err}")
+    return 1 if result["failures"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

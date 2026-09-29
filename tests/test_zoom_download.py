@@ -295,3 +295,28 @@ def test_process_all_aborts_on_expired_aws_credentials(tmp_path):
                        tmpdir=str(tmp_path), log=lambda m: None)
     assert list(tmp_path.iterdir()) == []
     assert len(client.seen) == 1  # stopped after the first file
+
+
+# ---- Task 6: CLI ------------------------------------------------------------
+def test_parse_args_defaults():
+    a = zd.parse_args([])
+    assert a.bucket == "sandgarden-zoom-uploads"
+    assert a.region == "us-east-2"
+    assert a.start == date(2026, 7, 1)
+    assert a.end is None
+    assert a.user == "me"
+    assert a.limit is None
+    assert a.list_only is False
+
+
+def test_parse_args_overrides():
+    a = zd.parse_args(["--from", "2026-08-01", "--to", "2026-08-31", "--limit", "2", "--list-only", "--bucket", "x"])
+    assert (a.start, a.end, a.limit, a.list_only, a.bucket) == (date(2026, 8, 1), date(2026, 8, 31), 2, True, "x")
+
+
+def test_main_exits_when_zoom_env_vars_missing(monkeypatch):
+    for v in ("ZOOM_ACCOUNT_ID", "ZOOM_CLIENT_ID", "ZOOM_CLIENT_SECRET"):
+        monkeypatch.delenv(v, raising=False)
+    with pytest.raises(SystemExit) as e:
+        zd.main([])
+    assert "ZOOM_ACCOUNT_ID" in str(e.value)

@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""
+Step 2: Read each transcript from S3 and have Claude (on Amazon Bedrock) write a
+documentary research report: who's in it, what was discussed with timestamps,
+themes, mood, great quotes. Then a master index across all videos.
+
+Run in AWS CloudShell after step 1:
+    python3 2_analyze.py YOUR-BUCKET-NAME [ONLY-TRANSCRIPTS-CONTAINING-THIS-TEXT]
+Then download reports.zip (CloudShell: Actions > Download file > reports.zip).
+"""
+import os, re, sys, time, zipfile
+import boto3
+
+REGION = "us-east-2"
+MODEL_ID = "us.amazon.nova-pro-v1:0"
+
+if len(sys.argv) < 2:
+    sys.exit("Usage: python3 2_analyze.py YOUR-BUCKET-NAME")
+BUCKET = sys.argv[1]
+FILTER = sys.argv[2] if len(sys.argv) > 2 else None   # optional: only analyze transcripts whose key contains this text
+
+s3 = boto3.client("s3", region_name=REGION)
+llm = boto3.client("bedrock-runtime", region_name=REGION)
+
+REPORT_PROMPT = """You are a documentary story researcher. Below is an auto-generated transcript of a recorded Zoom call
+(speakers are labeled spk_0, spk_1, etc. — the labels are NOT names). If a Zoom transcript with real participant
+names is also provided, use it to figure out who each speaker label is.
+
+Write a research report in Markdown with exactly these sections:
+
+## Participants
+Who was on the call. Map each speaker label to a real name if you can determine it (from the Zoom transcript,
+introductions, or people addressing each other by name). If you can't, say "unknown" — never guess.
+
+## Timeline of what was discussed
+A chronological list. Each entry: timestamp (hh:mm:ss), then 1-2 sentences on what was discussed. Aim for one entry
+every few minutes of conversation; more when the topic shifts quickly.
+
+## Themes
+The 3-7 big themes of the conversation, each with a one-paragraph explanation and pointers to timestamps.
+
+## Mood and tone
+How the conversation felt, and how it shifted over time (with timestamps). Note tension, humor, emotion, energy.
+
+## Great quotes
+10-25 verbatim quotes that would work on screen or in an edit, each with speaker and timestamp. Favor lines that are
+vivid, emotional, funny, or crystallize a theme. Do not paraphrase — copy the words exactly from the transcript.
+
+## Notes for the editor
+Anything else useful: moments that would make good scenes, unresolved questions, references to other people/events,
+audio problems or gaps in the transcript.
+
+Be concrete and specific. Use timestamps everywhere."""
+
+INDEX_PROMPT = """Below are research reports for a set of recorded Zoom calls for a documentary. Write a master index in Markdown:
+
+## The calls
+One line per call: filename, who was in it, one-sentence summary.
+
+## Themes across all calls
+The recurring themes, with which calls (and rough timestamps) best illustrate each.
+
+## People
+Every named person who appears, with which calls they're in and a one-line description of their role/perspective.
+
+## Strongest material
+The 20-30 best quotes or moments across everything, with call filename, speaker, and timestamp.
+
+## Suggested story threads
+3-5 possible narrative throughlines the footage could support, each pointing to specific calls and moments."""
+
+
+def ask(prompt, text, max_tokens=16000):
+    for attempt in range(6):
+        try:
+            r = llm.converse(
+                modelId=MODEL_ID,
+                messages=[{"role": "user", "content": [{"text": prompt + "\n\n---\n\n" + text}]}],
+                inferenceConfig={"maxTokens": min(max_tokens, 10000), "temperature": 0.3},
+            )
+            return r["output"]["message"]["content"][0]["text"]
+        except Exception as e:
+            if "Throttl" in str(e) or "TooMany" in str(e):
+                time.sleep(15 * (attempt + 1)); continue
+            raise
+    raise RuntimeError("Gave up after repeated throttling")
+
+
+def s3_text(key):
+    return s3.get_object(Bucket=BUCKET, Key=key)["Body"].read().decode("utf-8", "replace")
+
+
+def list_keys(prefix, suffix):
+    out = []
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=prefix):
+        out += [o["Key"] for o in page.get("Contents", []) if o["Key"].endswith(suffix)]
+    return out
+
+
+def find_zoom_vtt(stem):
+    """If a Zoom .vtt transcript with the same name was uploaded next to the video, use it for names."""
+    for key in list_keys("", ".vtt"):
+        if key.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower() == stem.lower():
+            return s3_text(key)
+    return None
+
+
+os.makedirs("reports", exist_ok=True)
+transcripts = list_keys("transcripts/", ".txt")
+if FILTER:
+    transcripts = [k for k in transcripts if FILTER in k]
+print(f"Found {len(transcripts)} transcript(s)")
+
+reports = []
+for key in transcripts:
+    stem = key.rsplit("/", 1)[-1][:-4]
+    local = f"reports/{stem}.md"
+    if os.path.exists(local):
+        print(f"skip (already done): {stem}"); reports.append((stem, open(local).read())); continue
+    text = f"FILENAME: {stem}\n\n{s3_text(key)}"
+    vtt = find_zoom_vtt(stem)
+    if vtt:
+        text += "\n\n=== ZOOM'S OWN TRANSCRIPT (has participant names) ===\n" + vtt
+    print(f"analyzing: {stem} ...")
+    report = f"# {stem}\n\n" + ask(REPORT_PROMPT, text)
+    open(local, "w").write(report)
+    s3.put_object(Bucket=BUCKET, Key=f"reports/{stem}.md", Body=report.encode())
+    reports.append((stem, report))
+    print(f"DONE {stem}")
+
+if reports:
+    print("Building master index across all calls...")
+    combined = "\n\n\n".join(f"===== REPORT: {s} =====\n{r}" for s, r in reports)
+    index = "# Master index — all calls\n\n" + ask(INDEX_PROMPT, combined, max_tokens=24000)
+    open("reports/00_MASTER_INDEX.md", "w").write(index)
+    s3.put_object(Bucket=BUCKET, Key="reports/00_MASTER_INDEX.md", Body=index.encode())
+
+    # Also copy the transcripts in, and zip everything for easy download.
+    os.makedirs("reports/transcripts", exist_ok=True)
+    for key in transcripts:
+        open("reports/transcripts/" + key.rsplit("/", 1)[-1], "w").write(s3_text(key))
+    with zipfile.ZipFile("reports.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        for root, _, files in os.walk("reports"):
+            for f in files:
+                z.write(os.path.join(root, f))
+    print("\nAll done. Download reports.zip: CloudShell menu Actions > Download file > type  reports.zip")

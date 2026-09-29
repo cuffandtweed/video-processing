@@ -120,3 +120,24 @@ def iter_recordings(client, start, end, user="me"):
             token = body.get("next_page_token") or None
             if not token:
                 break
+
+
+def slugify(text, max_len=60):
+    s = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return s[:max_len].rstrip("_") or "untitled"
+
+
+def make_key(item, part=0):
+    """`<date>_<topic>_<meeting id>.mp4`; extra MP4s on one meeting get `_1`, `_2`, ..."""
+    suffix = f"_{part}" if part else ""
+    return f"{item['start_time'][:10]}_{slugify(item['topic'])}_{item['meeting_id']}{suffix}.mp4"
+
+
+def key_exists(s3, bucket, key):
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise

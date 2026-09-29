@@ -174,3 +174,49 @@ def test_iter_recordings_uses_given_user():
     client = FakeClient([FakeResp(200, {"meetings": []})])
     list(zd.iter_recordings(client, date(2026, 7, 1), date(2026, 7, 2), user="liz@example.com"))
     assert client.requests[0][1] == "https://api.zoom.us/v2/users/liz@example.com/recordings"
+
+
+# ---- Task 4: naming and existence -----------------------------------------
+from botocore.exceptions import ClientError
+
+
+def test_slugify():
+    assert zd.slugify("Weekly Sync: Q3 / Plans!") == "weekly_sync_q3_plans"
+    assert zd.slugify("   ") == "untitled"
+    assert zd.slugify("") == "untitled"
+    assert len(zd.slugify("x" * 200)) == 60
+
+
+def test_make_key_first_and_additional_parts():
+    item = {"meeting_id": 123456789, "topic": "Kickoff Call", "start_time": "2026-07-05T15:00:00Z"}
+    assert zd.make_key(item) == "2026-07-05_kickoff_call_123456789.mp4"
+    assert zd.make_key(item, 1) == "2026-07-05_kickoff_call_123456789_1.mp4"
+
+
+class FakeS3:
+    def __init__(self, existing=()):
+        self.existing = set(existing)
+        self.uploads = []
+
+    def head_object(self, Bucket, Key):
+        if Key in self.existing:
+            return {}
+        raise ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+
+    def upload_file(self, path, bucket, key):
+        with open(path, "rb") as f:
+            self.uploads.append((key, f.read()))
+        self.existing.add(key)
+
+
+def test_key_exists_true_false_and_reraises_other_errors():
+    s3 = FakeS3(existing={"a.mp4"})
+    assert zd.key_exists(s3, "b", "a.mp4") is True
+    assert zd.key_exists(s3, "b", "missing.mp4") is False
+
+    class Denied:
+        def head_object(self, Bucket, Key):
+            raise ClientError({"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadObject")
+
+    with pytest.raises(ClientError):
+        zd.key_exists(Denied(), "b", "a.mp4")

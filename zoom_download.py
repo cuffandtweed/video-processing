@@ -21,7 +21,15 @@ from datetime import date, timedelta
 
 import boto3
 import requests
-from botocore.exceptions import ClientError, NoCredentialsError
+from botocore.exceptions import (
+    BotoCoreError,
+    ClientError,
+    CredentialRetrievalError,
+    NoCredentialsError,
+    PartialCredentialsError,
+    SSOError,
+    TokenRetrievalError,
+)
 
 TOKEN_URL = "https://zoom.us/oauth/token"
 API = "https://api.zoom.us/v2"
@@ -39,6 +47,12 @@ def date_windows(start, end, days=30):
         windows.append((cur, w_end))
         cur = w_end + timedelta(days=1)
     return windows
+
+
+def _raise_for_status(r):
+    """Like raise_for_status(), but keeps Zoom's response body (where the useful message is)."""
+    if r.status_code >= 400:
+        raise requests.HTTPError(f"{r.status_code} {r.text[:500]}", response=r)
 
 
 class ZoomAuth:
@@ -61,7 +75,7 @@ class ZoomAuth:
                 auth=(self.client_id, self.client_secret),
                 timeout=30,
             )
-            r.raise_for_status()
+            _raise_for_status(r)
             body = r.json()
             self._token = body["access_token"]
             self._expires_at = self._clock() + body.get("expires_in", 3600)
@@ -90,9 +104,13 @@ class ZoomClient:
                 refreshed = True
                 continue
             if r.status_code == 429:
-                self.sleep(float(r.headers.get("Retry-After", 2 ** attempt)))
+                try:
+                    delay = float(r.headers.get("Retry-After", 2 ** attempt))
+                except ValueError:  # e.g. an HTTP-date
+                    delay = 2 ** attempt
+                self.sleep(delay)
                 continue
-            r.raise_for_status()
+            _raise_for_status(r)
             return r
         raise RuntimeError(f"Gave up after {self.max_retries} attempts: {url}")
 
@@ -107,6 +125,7 @@ def iter_recordings(client, start, end, user="me"):
                 params["next_page_token"] = token
             body = client.request("GET", f"{API}/users/{user}/recordings", params=params).json()
             for m in body.get("meetings", []):
+                part = 0  # numbered within this one meeting, so it is stable across runs
                 for f in m.get("recording_files", []):
                     if f.get("file_type") == "MP4" and f.get("status") == "completed":
                         yield {
@@ -116,7 +135,9 @@ def iter_recordings(client, start, end, user="me"):
                             "file_id": f["id"],
                             "download_url": f["download_url"],
                             "size": f.get("file_size", 0),
+                            "part": part,
                         }
+                        part += 1
             token = body.get("next_page_token") or None
             if not token:
                 break
@@ -127,8 +148,9 @@ def slugify(text, max_len=60):
     return s[:max_len].rstrip("_") or "untitled"
 
 
-def make_key(item, part=0):
-    """`<date>_<topic>_<meeting id>.mp4`; extra MP4s on one meeting get `_1`, `_2`, ..."""
+def make_key(item):
+    """`<date>_<topic>_<meeting id>.mp4`; extra MP4s on one meeting (item["part"]) get `_1`, `_2`, ..."""
+    part = item.get("part", 0)
     suffix = f"_{part}" if part else ""
     return f"{item['start_time'][:10]}_{slugify(item['topic'])}_{item['meeting_id']}{suffix}.mp4"
 
@@ -147,11 +169,19 @@ class AwsCredentialsError(Exception):
     """AWS credentials are missing or expired; every later file would fail the same way."""
 
 
+AUTH_ERROR_CLASSES = (NoCredentialsError, PartialCredentialsError, SSOError, TokenRetrievalError,
+                      CredentialRetrievalError)
+AUTH_ERROR_CODES = ("ExpiredToken", "ExpiredTokenException", "InvalidAccessKeyId", "TokenRefreshRequired",
+                    "InvalidToken")
+
+
 def _is_aws_auth_error(e):
-    if isinstance(e, NoCredentialsError):
+    if isinstance(e, AUTH_ERROR_CLASSES):
         return True
-    text = str(e)
-    return any(s in text for s in ("ExpiredToken", "InvalidToken", "TokenRefreshRequired", "InvalidAccessKeyId"))
+    if isinstance(e, ClientError):
+        return e.response.get("Error", {}).get("Code") in AUTH_ERROR_CODES
+    # boto3's S3UploadFailedError carries only the message text
+    return "ExpiredToken" in str(e)
 
 
 def download_to(client, url, path, chunk=1 << 20):
@@ -165,36 +195,54 @@ def download_to(client, url, path, chunk=1 << 20):
         r.close()
 
 
-def process_all(items, client, s3, bucket, tmpdir=None, log=print):
-    """One file at a time: skip if in S3, else download, upload, delete the temp file."""
-    uploaded = skipped = 0
-    failures = []
-    parts = {}
+def process_all(items, client, s3, bucket, tmpdir=None, log=print, result=None):
+    """One file at a time: skip if in S3, else download, upload, delete the temp file.
+
+    Pass a dict as `result` to keep the running tallies even if listing raises mid-run.
+    """
+    result = result if result is not None else {}
+    result.update(uploaded=0, skipped=0, failures=[])
     for it in items:
-        n = parts.get(it["meeting_id"], 0)
-        parts[it["meeting_id"]] = n + 1
-        key = make_key(it, n)
+        key = make_key(it)
         try:
-            if key_exists(s3, bucket, key):
+            try:
+                exists = key_exists(s3, bucket, key)
+            except ClientError as e:
+                if e.response["Error"]["Code"] == "400":  # expired role credentials show up as a bare 400
+                    raise AwsCredentialsError(f"AWS credentials missing or expired: {e}") from e
+                raise
+            if exists:
                 log(f"skip (already in S3): {key}")
-                skipped += 1
+                result["skipped"] += 1
                 continue
             fd, path = tempfile.mkstemp(suffix=".mp4", dir=tmpdir)
             os.close(fd)
             try:
                 log(f"downloading: {key} ({it['size'] / 1e6:.1f} MB)")
                 download_to(client, it["download_url"], path)
+                written = os.path.getsize(path)
+                if it["size"] > 0 and written != it["size"]:
+                    raise ValueError(f"size mismatch: got {written} bytes, expected {it['size']}")
                 s3.upload_file(path, bucket, key)
             finally:
                 os.remove(path)
             log(f"uploaded: {key}")
-            uploaded += 1
+            result["uploaded"] += 1
+        except AwsCredentialsError:
+            raise
         except Exception as e:
             if _is_aws_auth_error(e):
                 raise AwsCredentialsError(f"AWS credentials missing or expired: {e}") from e
             log(f"FAILED: {key}: {e}")
-            failures.append((key, str(e)))
-    return {"uploaded": uploaded, "skipped": skipped, "failures": failures}
+            result["failures"].append((key, str(e)))
+    return result
+
+
+def positive_int(text):
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return n
 
 
 def parse_args(argv=None):
@@ -206,9 +254,39 @@ def parse_args(argv=None):
     p.add_argument("--to", dest="end", type=date.fromisoformat, default=None,
                    help="last day to include, YYYY-MM-DD (default today)")
     p.add_argument("--user", default="me", help="Zoom user id or email whose recordings to list (default: me)")
-    p.add_argument("--limit", type=int, default=None, help="stop after N files (for testing)")
+    p.add_argument("--limit", type=positive_int, default=None,
+                   help="stop after N files, at least 1 (for testing); files skipped because they are "
+                        "already in S3 count toward the limit")
     p.add_argument("--list-only", action="store_true", help="list matching recordings, download nothing")
     return p.parse_args(argv)
+
+
+AWS_LOGIN_HINT = "Refresh with:  aws sso login --profile <your profile>"
+
+
+def print_summary(result):
+    print(f"\nDone: {result['uploaded']} uploaded, {result['skipped']} skipped, {len(result['failures'])} failed")
+    for key, err in result["failures"]:
+        print(f"  FAILED {key}: {err}")
+
+
+def check_bucket(s3, bucket):
+    """Preflight: one cheap call that surfaces bad/expired credentials or a bad bucket.
+
+    Returns an error message, or None if the bucket is reachable.
+    """
+    try:
+        s3.head_bucket(Bucket=bucket)
+    except (ClientError, BotoCoreError) as e:
+        code = e.response["Error"]["Code"] if isinstance(e, ClientError) else None
+        if _is_aws_auth_error(e) or code == "400":
+            return f"AWS credentials missing or expired: {e}\n{AWS_LOGIN_HINT}"
+        if code in ("404", "NoSuchBucket", "NotFound"):
+            return f"S3 bucket '{bucket}' does not exist (or is in another region): {e}"
+        if code == "403":
+            return f"Access denied to S3 bucket '{bucket}': {e}"
+        return f"Could not access S3 bucket '{bucket}': {e}"
+    return None
 
 
 def main(argv=None):
@@ -218,31 +296,41 @@ def main(argv=None):
         sys.exit("Missing environment variables: " + ", ".join(missing))
 
     end = args.end or date.today()
+    s3 = None
+    if not args.list_only:
+        s3 = boto3.client("s3", region_name=args.region)
+        problem = check_bucket(s3, args.bucket)
+        if problem:
+            print(f"Stopped: {problem}")
+            return 1
+
     auth = ZoomAuth(os.environ["ZOOM_ACCOUNT_ID"], os.environ["ZOOM_CLIENT_ID"], os.environ["ZOOM_CLIENT_SECRET"])
     client = ZoomClient(auth)
     items = iter_recordings(client, args.start, end, user=args.user)
     if args.limit is not None:
         items = itertools.islice(items, args.limit)
 
-    if args.list_only:
-        count = 0
-        for it in items:
-            print(f"{make_key(it)}  ({it['size'] / 1e6:.1f} MB)")
-            count += 1
-        print(f"{count} recording(s) match {args.start} .. {end}")
-        return 0
-
-    s3 = boto3.client("s3", region_name=args.region)
+    result = {"uploaded": 0, "skipped": 0, "failures": []}
     try:
-        result = process_all(items, client, s3, args.bucket)
+        if args.list_only:
+            count = 0
+            for it in items:
+                print(f"{make_key(it)}  ({it['size'] / 1e6:.1f} MB)")
+                count += 1
+            print(f"{count} recording(s) match {args.start} .. {end}")
+            return 0
+        process_all(items, client, s3, args.bucket, result=result)
     except AwsCredentialsError as e:
-        print(f"\nStopped: {e}\nRefresh with:  aws sso login --profile <your profile>")
+        print(f"\nStopped: {e}\n{AWS_LOGIN_HINT}")
+        print_summary(result)
         return 1
-    print(f"\nDone: {result['uploaded']} uploaded, {result['skipped']} skipped, {len(result['failures'])} failed")
-    for key, err in result["failures"]:
-        print(f"  FAILED {key}: {err}")
+    except (requests.HTTPError, RuntimeError) as e:
+        print(f"\nStopped: Zoom API error: {e}")
+        if not args.list_only:
+            print_summary(result)
+        return 2
+    print_summary(result)
     return 1 if result["failures"] else 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

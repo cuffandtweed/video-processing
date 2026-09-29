@@ -11,8 +11,9 @@ import zoom_download as zd
 
 # ---- fakes shared by all tests -------------------------------------------
 class FakeResp:
-    def __init__(self, status=200, body=None, headers=None, chunks=None):
+    def __init__(self, status=200, body=None, headers=None, chunks=None, text=""):
         self.status_code = status
+        self.text = text
         self._body = body if body is not None else {}
         self.headers = headers or {}
         self._chunks = chunks or []
@@ -161,7 +162,8 @@ def test_iter_recordings_pages_through_windows_and_filters():
     items = list(zd.iter_recordings(client, date(2026, 7, 1), date(2026, 7, 31)))
     assert [i["file_id"] for i in items] == ["f1", "f4"]
     assert items[0] == {"meeting_id": 1, "topic": "Kickoff", "start_time": "2026-07-05T15:00:00Z",
-                        "file_id": "f1", "download_url": "https://zoom.us/rec/download/f1", "size": 1000}
+                        "file_id": "f1", "download_url": "https://zoom.us/rec/download/f1", "size": 1000,
+                        "part": 0}
     # three requests: window 1 page 1, window 1 page 2 (with token), window 2 page 1
     assert len(client.requests) == 3
     assert client.requests[0][1] == "https://api.zoom.us/v2/users/me/recordings"
@@ -177,6 +179,7 @@ def test_iter_recordings_uses_given_user():
 
 
 # ---- Task 4: naming and existence -----------------------------------------
+import botocore.exceptions
 from botocore.exceptions import ClientError
 
 
@@ -190,7 +193,8 @@ def test_slugify():
 def test_make_key_first_and_additional_parts():
     item = {"meeting_id": 123456789, "topic": "Kickoff Call", "start_time": "2026-07-05T15:00:00Z"}
     assert zd.make_key(item) == "2026-07-05_kickoff_call_123456789.mp4"
-    assert zd.make_key(item, 1) == "2026-07-05_kickoff_call_123456789_1.mp4"
+    assert zd.make_key({**item, "part": 0}) == "2026-07-05_kickoff_call_123456789.mp4"
+    assert zd.make_key({**item, "part": 1}) == "2026-07-05_kickoff_call_123456789_1.mp4"
 
 
 class FakeS3:
@@ -226,9 +230,9 @@ def test_key_exists_true_false_and_reraises_other_errors():
 import boto3.exceptions
 
 
-def item(mid, topic="Call", start="2026-07-05T15:00:00Z", fid="f", size=3):
+def item(mid, topic="Call", start="2026-07-05T15:00:00Z", fid="f", size=3, part=0):
     return {"meeting_id": mid, "topic": topic, "start_time": start, "file_id": fid,
-            "download_url": f"https://zoom.us/rec/download/{fid}", "size": size}
+            "download_url": f"https://zoom.us/rec/download/{fid}", "size": size, "part": part}
 
 
 class DownloadClient:
@@ -280,7 +284,7 @@ def test_process_all_records_failure_and_continues(tmp_path):
 def test_process_all_numbers_second_mp4_on_same_meeting(tmp_path):
     s3 = FakeS3()
     client = DownloadClient({"https://zoom.us/rec/download/a": b"aaa", "https://zoom.us/rec/download/b": b"bbb"})
-    zd.process_all([item(1, fid="a"), item(1, fid="b")], client, s3, "bkt", tmpdir=str(tmp_path), log=lambda m: None)
+    zd.process_all([item(1, fid="a"), item(1, fid="b", part=1)], client, s3, "bkt", tmpdir=str(tmp_path), log=lambda m: None)
     assert [k for k, _ in s3.uploads] == ["2026-07-05_call_1.mp4", "2026-07-05_call_1_1.mp4"]
 
 
@@ -320,3 +324,153 @@ def test_main_exits_when_zoom_env_vars_missing(monkeypatch):
     with pytest.raises(SystemExit) as e:
         zd.main([])
     assert "ZOOM_ACCOUNT_ID" in str(e.value)
+
+
+# ---- final review fixes -------------------------------------------------------
+def test_parts_are_numbered_per_meeting_not_per_numeric_id():
+    client = FakeClient([FakeResp(200, {"meetings": [
+        meeting(123, "x", [mp4("a")], start="2026-07-05T15:00:00Z"),
+        meeting(123, "x", [mp4("b")], start="2026-07-12T15:00:00Z"),
+        meeting(123, "x", [mp4("c"), m4a("d"), mp4("e")], start="2026-07-19T15:00:00Z"),
+    ]})])
+    items = list(zd.iter_recordings(client, date(2026, 7, 1), date(2026, 7, 2)))
+    assert [zd.make_key(i) for i in items] == [
+        "2026-07-05_x_123.mp4", "2026-07-12_x_123.mp4", "2026-07-19_x_123.mp4", "2026-07-19_x_123_1.mp4"]
+
+
+def test_process_all_aborts_when_head_object_returns_400(tmp_path):
+    class Expired(FakeS3):
+        def head_object(self, Bucket, Key):
+            raise ClientError({"Error": {"Code": "400", "Message": "Bad Request"}}, "HeadObject")
+
+    client = DownloadClient({})
+    with pytest.raises(zd.AwsCredentialsError):
+        zd.process_all([item(1, fid="f1"), item(2, fid="f2")], client, Expired(), "bkt",
+                       tmpdir=str(tmp_path), log=lambda m: None)
+    assert client.seen == []
+
+
+@pytest.mark.parametrize("exc", [
+    botocore.exceptions.UnauthorizedSSOTokenError(),
+    botocore.exceptions.TokenRetrievalError(provider="sso", error_msg="expired"),
+    botocore.exceptions.NoCredentialsError(),
+    ClientError({"Error": {"Code": "ExpiredTokenException", "Message": "x"}}, "HeadObject"),
+])
+def test_process_all_aborts_on_sso_and_token_errors(tmp_path, exc):
+    class Broken(FakeS3):
+        def head_object(self, Bucket, Key):
+            raise exc
+
+    with pytest.raises(zd.AwsCredentialsError):
+        zd.process_all([item(1, fid="f1")], DownloadClient({}), Broken(), "bkt",
+                       tmpdir=str(tmp_path), log=lambda m: None)
+
+
+def test_process_all_records_size_mismatch_and_does_not_upload(tmp_path):
+    s3 = FakeS3()
+    client = DownloadClient({"https://zoom.us/rec/download/f1": b"abc"})
+    result = zd.process_all([item(1, fid="f1", size=10)], client, s3, "bkt", tmpdir=str(tmp_path),
+                            log=lambda m: None)
+    assert s3.uploads == []
+    assert result["uploaded"] == 0
+    assert [k for k, _ in result["failures"]] == ["2026-07-05_call_1.mp4"]
+    assert "size mismatch" in result["failures"][0][1]
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_client_error_includes_response_body():
+    sess = FakeSession([token_resp("t1"), FakeResp(400, text='{"message":"Invalid scope"}')])
+    auth = zd.ZoomAuth("a", "i", "s", session=sess, clock=lambda: 0)
+    client = zd.ZoomClient(auth, session=sess, sleep=lambda s: None)
+    with pytest.raises(requests.HTTPError) as e:
+        client.request("GET", "https://api.zoom.us/v2/x")
+    assert "400" in str(e.value) and "Invalid scope" in str(e.value)
+
+
+def test_client_falls_back_to_backoff_on_http_date_retry_after():
+    sleeps = []
+    date_hdr = {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}
+    sess = FakeSession([token_resp("t1"), FakeResp(429, headers=date_hdr), FakeResp(200, {"ok": 1})])
+    auth = zd.ZoomAuth("a", "i", "s", session=sess, clock=lambda: 0)
+    client = zd.ZoomClient(auth, session=sess, sleep=sleeps.append)
+    assert client.request("GET", "https://api.zoom.us/v2/x").json() == {"ok": 1}
+    assert sleeps == [1]  # 2 ** attempt 0
+
+
+def test_parse_args_rejects_limit_below_one():
+    for bad in ("0", "-3"):
+        with pytest.raises(SystemExit):
+            zd.parse_args(["--limit", bad])
+
+
+# ---- main() ---------------------------------------------------------------------
+@pytest.fixture
+def zoom_env(monkeypatch):
+    for v in ("ZOOM_ACCOUNT_ID", "ZOOM_CLIENT_ID", "ZOOM_CLIENT_SECRET"):
+        monkeypatch.setenv(v, "x")
+    monkeypatch.setattr(zd, "ZoomAuth", lambda *a, **k: object())
+    monkeypatch.setattr(zd, "ZoomClient", lambda auth: object())
+
+
+class BucketS3(FakeS3):
+    def __init__(self, head_bucket_error=None, **kw):
+        super().__init__(**kw)
+        self.head_bucket_error = head_bucket_error
+
+    def head_bucket(self, Bucket):
+        if self.head_bucket_error:
+            raise self.head_bucket_error
+        return {}
+
+
+def test_main_list_only_prints_keys_and_count(monkeypatch, zoom_env, capsys):
+    monkeypatch.setattr(zd, "iter_recordings", lambda *a, **k: iter([
+        item(1, fid="a", size=2_000_000), item(1, fid="b", part=1, size=1_000_000)]))
+    monkeypatch.setattr(zd.boto3, "client", lambda *a, **k: pytest.fail("no AWS in --list-only"))
+    assert zd.main(["--list-only", "--from", "2026-07-01", "--to", "2026-07-31"]) == 0
+    out = capsys.readouterr().out
+    assert "2026-07-05_call_1.mp4  (2.0 MB)" in out
+    assert "2026-07-05_call_1_1.mp4  (1.0 MB)" in out
+    assert "2 recording(s) match 2026-07-01 .. 2026-07-31" in out
+
+
+def test_main_returns_1_when_files_fail(monkeypatch, zoom_env, capsys):
+    monkeypatch.setattr(zd.boto3, "client", lambda *a, **k: BucketS3())
+    monkeypatch.setattr(zd, "iter_recordings", lambda *a, **k: iter([item(1)]))
+    monkeypatch.setattr(zd, "process_all", lambda items, client, s3, bucket, result: (
+        result.update(uploaded=0, skipped=0, failures=[("k.mp4", "boom")]) or result))
+    assert zd.main([]) == 1
+    assert "FAILED k.mp4: boom" in capsys.readouterr().out
+
+
+def test_main_returns_0_on_success(monkeypatch, zoom_env, capsys):
+    monkeypatch.setattr(zd.boto3, "client", lambda *a, **k: BucketS3())
+    monkeypatch.setattr(zd, "iter_recordings", lambda *a, **k: iter([]))
+    assert zd.main([]) == 0
+    assert "0 uploaded, 0 skipped, 0 failed" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("error,expected", [
+    (botocore.exceptions.UnauthorizedSSOTokenError(), "aws sso login"),
+    (ClientError({"Error": {"Code": "400", "Message": "Bad Request"}}, "HeadBucket"), "aws sso login"),
+    (ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadBucket"), "does not exist"),
+    (ClientError({"Error": {"Code": "403", "Message": "Forbidden"}}, "HeadBucket"), "Access denied"),
+])
+def test_main_returns_1_when_preflight_fails(monkeypatch, zoom_env, capsys, error, expected):
+    monkeypatch.setattr(zd.boto3, "client", lambda *a, **k: BucketS3(head_bucket_error=error))
+    monkeypatch.setattr(zd, "iter_recordings", lambda *a, **k: pytest.fail("must not list before preflight"))
+    assert zd.main([]) == 1
+    assert expected in capsys.readouterr().out
+
+
+def test_main_reports_zoom_error_body_and_partial_summary(monkeypatch, zoom_env, capsys, tmp_path):
+    def listing(*a, **k):
+        yield item(1, fid="f1")
+        raise requests.HTTPError("400 Invalid scope: recording:read")
+
+    monkeypatch.setattr(zd.boto3, "client", lambda *a, **k: BucketS3(existing={"2026-07-05_call_1.mp4"}))
+    monkeypatch.setattr(zd, "iter_recordings", listing)
+    assert zd.main([]) == 2
+    out = capsys.readouterr().out
+    assert "400 Invalid scope: recording:read" in out
+    assert "0 uploaded, 1 skipped, 0 failed" in out

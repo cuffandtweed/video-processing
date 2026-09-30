@@ -1,0 +1,20 @@
+# Pipeline output and media: generated per run, never commit
+reports/
+reports_*/
+reports*.zip
+*.mp4
+*.m4a
+*.mov
+*.mkv
+*.webm
+*.avi
+*.vtt
+
+# Secrets and local config
+.env
+.env.*
+
+# Tooling scratch
+.superpowers/
+__pycache__/
+.pytest_cache/

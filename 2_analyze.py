@@ -10,9 +10,11 @@ Then download reports.zip (CloudShell: Actions > Download file > reports.zip).
 """
 import os, re, sys, time, zipfile
 import boto3
+from botocore.config import Config
+from transcript_checks import has_speech, no_speech_report, quote_note
 
 REGION = "us-east-2"
-MODEL_ID = "us.amazon.nova-pro-v1:0"
+MODEL_ID = "us.anthropic.claude-opus-4-6-v1"
 
 if len(sys.argv) < 2:
     sys.exit("Usage: python3 2_analyze.py YOUR-BUCKET-NAME")
@@ -20,7 +22,8 @@ BUCKET = sys.argv[1]
 FILTER = sys.argv[2] if len(sys.argv) > 2 else None   # optional: only analyze transcripts whose key contains this text
 
 s3 = boto3.client("s3", region_name=REGION)
-llm = boto3.client("bedrock-runtime", region_name=REGION)
+# Long reports from a large model can take minutes; botocore's default 60s read timeout is too short.
+llm = boto3.client("bedrock-runtime", region_name=REGION, config=Config(read_timeout=900, retries={"max_attempts": 3}))
 
 REPORT_PROMPT = """You are a documentary story researcher. Below is an auto-generated transcript of a recorded Zoom call
 (speakers are labeled spk_0, spk_1, etc. — the labels are NOT names). If a Zoom transcript with real participant
@@ -76,7 +79,7 @@ def ask(prompt, text, max_tokens=16000):
             r = llm.converse(
                 modelId=MODEL_ID,
                 messages=[{"role": "user", "content": [{"text": prompt + "\n\n---\n\n" + text}]}],
-                inferenceConfig={"maxTokens": min(max_tokens, 10000), "temperature": 0.3},
+                inferenceConfig={"maxTokens": max_tokens, "temperature": 0.3},
             )
             return r["output"]["message"]["content"][0]["text"]
         except Exception as e:
@@ -111,34 +114,51 @@ if FILTER:
     transcripts = [k for k in transcripts if FILTER in k]
 print(f"Found {len(transcripts)} transcript(s)")
 
-reports = []
+reports = []   # (stem, report) for calls that have spoken content
+silent = []    # stems whose transcript has no speech, so no model report is written for them
+texts = {}
 for key in transcripts:
     stem = key.rsplit("/", 1)[-1][:-4]
     local = f"reports/{stem}.md"
+    transcript = s3_text(key)
+    texts[stem] = transcript
+    spoken = has_speech(transcript)
     if os.path.exists(local):
-        print(f"skip (already done): {stem}"); reports.append((stem, open(local).read())); continue
-    text = f"FILENAME: {stem}\n\n{s3_text(key)}"
-    vtt = find_zoom_vtt(stem)
-    if vtt:
-        text += "\n\n=== ZOOM'S OWN TRANSCRIPT (has participant names) ===\n" + vtt
-    print(f"analyzing: {stem} ...")
-    report = f"# {stem}\n\n" + ask(REPORT_PROMPT, text)
-    open(local, "w").write(report)
-    s3.put_object(Bucket=BUCKET, Key=f"reports/{stem}.md", Body=report.encode())
-    reports.append((stem, report))
-    print(f"DONE {stem}")
+        print(f"skip (already done): {stem}")
+        report = open(local, encoding="utf-8").read()
+    else:
+        if spoken:
+            text = f"FILENAME: {stem}\n\n{transcript}"
+            vtt = find_zoom_vtt(stem)
+            if vtt:
+                text += "\n\n=== ZOOM'S OWN TRANSCRIPT (has participant names) ===\n" + vtt
+            print(f"analyzing: {stem} ...")
+            report = f"# {stem}\n\n" + ask(REPORT_PROMPT, text)
+            report += quote_note(report, transcript)
+        else:
+            print(f"no spoken content, not sending to the model: {stem}")
+            report = no_speech_report(stem)
+        open(local, "w", encoding="utf-8").write(report)
+        s3.put_object(Bucket=BUCKET, Key=f"reports/{stem}.md", Body=report.encode())
+        print(f"DONE {stem}")
+    (reports if spoken else silent).append((stem, report))
 
-if reports:
+if reports or silent:
     print("Building master index across all calls...")
-    combined = "\n\n\n".join(f"===== REPORT: {s} =====\n{r}" for s, r in reports)
-    index = "# Master index — all calls\n\n" + ask(INDEX_PROMPT, combined, max_tokens=24000)
-    open("reports/00_MASTER_INDEX.md", "w").write(index)
+    index = "# Master index — all calls\n\n"
+    if reports:
+        combined = "\n\n\n".join(f"===== REPORT: {s} =====\n{r}" for s, r in reports)
+        body = ask(INDEX_PROMPT, combined, max_tokens=24000)
+        index += body + quote_note(body, "\n".join(texts[s] for s, _ in reports))
+    if silent:
+        index += "\n\n## Calls with no spoken content\n" + "\n".join(f"- `{s}`" for s, _ in silent) + "\n"
+    open("reports/00_MASTER_INDEX.md", "w", encoding="utf-8").write(index)
     s3.put_object(Bucket=BUCKET, Key="reports/00_MASTER_INDEX.md", Body=index.encode())
 
     # Also copy the transcripts in, and zip everything for easy download.
     os.makedirs("reports/transcripts", exist_ok=True)
     for key in transcripts:
-        open("reports/transcripts/" + key.rsplit("/", 1)[-1], "w").write(s3_text(key))
+        open("reports/transcripts/" + key.rsplit("/", 1)[-1], "w", encoding="utf-8").write(s3_text(key))
     with zipfile.ZipFile("reports.zip", "w", zipfile.ZIP_DEFLATED) as z:
         for root, _, files in os.walk("reports"):
             for f in files:

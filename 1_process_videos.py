@@ -109,27 +109,68 @@ def build_transcript(result):
     return "\n".join(lines)
 
 
+MAX_JOBS = 3  # Bedrock Data Automation allows 3 concurrent jobs per account by default
+
+
+def save_transcript(stem, result):
+    s3.put_object(Bucket=BUCKET, Key=f"transcripts/{stem}.json", Body=json.dumps(result).encode())
+    s3.put_object(Bucket=BUCKET, Key=f"transcripts/{stem}.txt", Body=build_transcript(result).encode())
+
+
+def recover_finished(stem):
+    """Finished BDA output left by an earlier interrupted run: return its result dict, else None."""
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix=f"bda-output/{stem}/"):
+        for o in page.get("Contents", []):
+            if o["Key"].endswith("job_metadata.json"):
+                try:
+                    meta = read_json(f"s3://{BUCKET}/{o['Key']}")
+                    return read_json(meta["output_metadata"][0]["segment_metadata"][0]["standard_output_path"])
+                except Exception:
+                    return None
+    return None
+
+
+def submit(key, stem):
+    """Start a job; if BDA reports its concurrent-job limit, wait for a slot and retry."""
+    while True:
+        try:
+            resp = bda_rt.invoke_data_automation_async(
+                inputConfiguration={"s3Uri": f"s3://{BUCKET}/{key}"},
+                outputConfiguration={"s3Uri": f"s3://{BUCKET}/bda-output/{stem}/"},
+                dataAutomationConfiguration={"dataAutomationProjectArn": project_arn, "stage": "LIVE"},
+                dataAutomationProfileArn=PROFILE_ARN,
+            )
+            return resp["invocationArn"]
+        except bda_rt.exceptions.ServiceQuotaExceededException:
+            print("BDA is at its concurrent-job limit; waiting 60s for a free slot...")
+            time.sleep(60)
+
+
 project_arn = get_or_create_project()
 videos = list_videos()
 print(f"Found {len(videos)} video(s) in s3://{BUCKET}")
 
-jobs = {}
+pending = []
 for key in videos:
     stem = key.rsplit("/", 1)[-1].rsplit(".", 1)[0]
     if already_done(stem):
         print(f"skip (already done): {key}")
         continue
-    resp = bda_rt.invoke_data_automation_async(
-        inputConfiguration={"s3Uri": f"s3://{BUCKET}/{key}"},
-        outputConfiguration={"s3Uri": f"s3://{BUCKET}/bda-output/{stem}/"},
-        dataAutomationConfiguration={"dataAutomationProjectArn": project_arn, "stage": "LIVE"},
-        dataAutomationProfileArn=PROFILE_ARN,
-    )
-    jobs[resp["invocationArn"]] = (key, stem)
-    print(f"submitted: {key}")
+    result = recover_finished(stem)
+    if result is not None:
+        save_transcript(stem, result)
+        print(f"recovered finished output from an earlier run: {key}")
+        continue
+    pending.append((key, stem))
 
-print(f"\n{len(jobs)} job(s) running. Checking every 60s (a 1-hour video takes roughly 10-20 min)...")
-while jobs:
+print(f"\n{len(pending)} video(s) to process, at most {MAX_JOBS} at a time. Checking every 60s "
+      "(a 1-hour video takes roughly 10-20 min)...")
+jobs = {}
+while pending or jobs:
+    while pending and len(jobs) < MAX_JOBS:
+        key, stem = pending.pop(0)
+        jobs[submit(key, stem)] = (key, stem)
+        print(f"submitted: {key}")
     time.sleep(60)
     for arn in list(jobs):
         key, stem = jobs[arn]
@@ -144,8 +185,7 @@ while jobs:
         meta = read_json(st["outputConfiguration"]["s3Uri"])
         result_uri = meta["output_metadata"][0]["segment_metadata"][0]["standard_output_path"]
         result = read_json(result_uri)
-        s3.put_object(Bucket=BUCKET, Key=f"transcripts/{stem}.json", Body=json.dumps(result).encode())
-        s3.put_object(Bucket=BUCKET, Key=f"transcripts/{stem}.txt", Body=build_transcript(result).encode())
-        print(f"DONE {key} -> s3://{BUCKET}/transcripts/{stem}.txt   ({len(jobs)} still running)")
+        save_transcript(stem, result)
+        print(f"DONE {key} -> s3://{BUCKET}/transcripts/{stem}.txt   ({len(jobs)} running, {len(pending)} waiting)")
 
 print("\nAll done. Now run:  python3 2_analyze.py", BUCKET)

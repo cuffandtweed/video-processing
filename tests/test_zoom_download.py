@@ -190,11 +190,18 @@ def test_slugify():
     assert len(zd.slugify("x" * 200)) == 60
 
 
+def test_make_key_differs_for_same_meeting_id_held_twice_in_a_day():
+    a = {"meeting_id": 5, "topic": "Daily Sync", "start_time": "2026-09-29T15:03:04Z"}
+    b = {"meeting_id": 5, "topic": "Daily Sync", "start_time": "2026-09-29T19:30:00Z"}
+    assert zd.make_key(a) == "2026-09-29_150304_daily_sync_5.mp4"
+    assert zd.make_key(b) == "2026-09-29_193000_daily_sync_5.mp4"
+
+
 def test_make_key_first_and_additional_parts():
     item = {"meeting_id": 123456789, "topic": "Kickoff Call", "start_time": "2026-07-05T15:00:00Z"}
-    assert zd.make_key(item) == "2026-07-05_kickoff_call_123456789.mp4"
-    assert zd.make_key({**item, "part": 0}) == "2026-07-05_kickoff_call_123456789.mp4"
-    assert zd.make_key({**item, "part": 1}) == "2026-07-05_kickoff_call_123456789_1.mp4"
+    assert zd.make_key(item) == "2026-07-05_150000_kickoff_call_123456789.mp4"
+    assert zd.make_key({**item, "part": 0}) == "2026-07-05_150000_kickoff_call_123456789.mp4"
+    assert zd.make_key({**item, "part": 1}) == "2026-07-05_150000_kickoff_call_123456789_1.mp4"
 
 
 class FakeS3:
@@ -255,13 +262,13 @@ def test_process_all_downloads_uploads_and_cleans_up(tmp_path):
     client = DownloadClient({"https://zoom.us/rec/download/f1": b"abc"})
     result = zd.process_all([item(1, fid="f1")], client, s3, "bkt", tmpdir=str(tmp_path), log=lambda m: None)
     assert result == {"uploaded": 1, "skipped": 0, "failures": []}
-    assert s3.uploads == [("2026-07-05_call_1.mp4", b"abc")]
+    assert s3.uploads == [("2026-07-05_150000_call_1.mp4", b"abc")]
     assert list(tmp_path.iterdir()) == []
     assert client.seen[0][2] == {"stream": True}
 
 
 def test_process_all_skips_existing_without_downloading(tmp_path):
-    s3 = FakeS3(existing={"2026-07-05_call_1.mp4"})
+    s3 = FakeS3(existing={"2026-07-05_150000_call_1.mp4"})
     client = DownloadClient({})
     result = zd.process_all([item(1, fid="f1")], client, s3, "bkt", tmpdir=str(tmp_path), log=lambda m: None)
     assert result == {"uploaded": 0, "skipped": 1, "failures": []}
@@ -277,7 +284,7 @@ def test_process_all_records_failure_and_continues(tmp_path):
     result = zd.process_all([item(1, fid="f1"), item(2, fid="f2")], client, s3, "bkt",
                             tmpdir=str(tmp_path), log=lambda m: None)
     assert result["uploaded"] == 1
-    assert [k for k, _ in result["failures"]] == ["2026-07-05_call_1.mp4"]
+    assert [k for k, _ in result["failures"]] == ["2026-07-05_150000_call_1.mp4"]
     assert list(tmp_path.iterdir()) == []
 
 
@@ -285,7 +292,7 @@ def test_process_all_numbers_second_mp4_on_same_meeting(tmp_path):
     s3 = FakeS3()
     client = DownloadClient({"https://zoom.us/rec/download/a": b"aaa", "https://zoom.us/rec/download/b": b"bbb"})
     zd.process_all([item(1, fid="a"), item(1, fid="b", part=1)], client, s3, "bkt", tmpdir=str(tmp_path), log=lambda m: None)
-    assert [k for k, _ in s3.uploads] == ["2026-07-05_call_1.mp4", "2026-07-05_call_1_1.mp4"]
+    assert [k for k, _ in s3.uploads] == ["2026-07-05_150000_call_1.mp4", "2026-07-05_150000_call_1_1.mp4"]
 
 
 def test_process_all_aborts_on_expired_aws_credentials(tmp_path):
@@ -302,6 +309,33 @@ def test_process_all_aborts_on_expired_aws_credentials(tmp_path):
 
 
 # ---- Task 6: CLI ------------------------------------------------------------
+def test_iter_recordings_account_mode_uses_account_endpoint():
+    client = FakeClient([FakeResp(200, {"meetings": []})])
+    list(zd.iter_recordings(client, date(2026, 7, 1), date(2026, 7, 2), account=True))
+    assert client.requests[0][1] == "https://api.zoom.us/v2/accounts/me/recordings"
+
+
+def test_parse_args_account_flag():
+    assert zd.parse_args([]).account is False
+    assert zd.parse_args(["--account"]).account is True
+
+
+def test_main_passes_account_flag_to_listing(monkeypatch, capsys):
+    for v in ("ZOOM_ACCOUNT_ID", "ZOOM_CLIENT_ID", "ZOOM_CLIENT_SECRET"):
+        monkeypatch.setenv(v, "x")
+    seen = {}
+
+    def listing(client, start, end, user="me", account=False):
+        seen["account"] = account
+        return iter([])
+
+    monkeypatch.setattr(zd, "iter_recordings", listing)
+    monkeypatch.setattr(zd, "ZoomAuth", lambda *a, **k: object())
+    monkeypatch.setattr(zd, "ZoomClient", lambda *a, **k: object())
+    assert zd.main(["--list-only", "--account"]) == 0
+    assert seen["account"] is True
+
+
 def test_parse_args_defaults():
     a = zd.parse_args([])
     assert a.bucket == "sandgarden-zoom-uploads"
@@ -335,7 +369,7 @@ def test_parts_are_numbered_per_meeting_not_per_numeric_id():
     ]})])
     items = list(zd.iter_recordings(client, date(2026, 7, 1), date(2026, 7, 2)))
     assert [zd.make_key(i) for i in items] == [
-        "2026-07-05_x_123.mp4", "2026-07-12_x_123.mp4", "2026-07-19_x_123.mp4", "2026-07-19_x_123_1.mp4"]
+        "2026-07-05_150000_x_123.mp4", "2026-07-12_150000_x_123.mp4", "2026-07-19_150000_x_123.mp4", "2026-07-19_150000_x_123_1.mp4"]
 
 
 def test_process_all_aborts_when_head_object_returns_400(tmp_path):
@@ -373,7 +407,7 @@ def test_process_all_records_size_mismatch_and_does_not_upload(tmp_path):
                             log=lambda m: None)
     assert s3.uploads == []
     assert result["uploaded"] == 0
-    assert [k for k, _ in result["failures"]] == ["2026-07-05_call_1.mp4"]
+    assert [k for k, _ in result["failures"]] == ["2026-07-05_150000_call_1.mp4"]
     assert "size mismatch" in result["failures"][0][1]
     assert list(tmp_path.iterdir()) == []
 
@@ -429,8 +463,8 @@ def test_main_list_only_prints_keys_and_count(monkeypatch, zoom_env, capsys):
     monkeypatch.setattr(zd.boto3, "client", lambda *a, **k: pytest.fail("no AWS in --list-only"))
     assert zd.main(["--list-only", "--from", "2026-07-01", "--to", "2026-07-31"]) == 0
     out = capsys.readouterr().out
-    assert "2026-07-05_call_1.mp4  (2.0 MB)" in out
-    assert "2026-07-05_call_1_1.mp4  (1.0 MB)" in out
+    assert "2026-07-05_150000_call_1.mp4  (2.0 MB)" in out
+    assert "2026-07-05_150000_call_1_1.mp4  (1.0 MB)" in out
     assert "2 recording(s) match 2026-07-01 .. 2026-07-31" in out
 
 
@@ -468,7 +502,7 @@ def test_main_reports_zoom_error_body_and_partial_summary(monkeypatch, zoom_env,
         yield item(1, fid="f1")
         raise requests.HTTPError("400 Invalid scope: recording:read")
 
-    monkeypatch.setattr(zd.boto3, "client", lambda *a, **k: BucketS3(existing={"2026-07-05_call_1.mp4"}))
+    monkeypatch.setattr(zd.boto3, "client", lambda *a, **k: BucketS3(existing={"2026-07-05_150000_call_1.mp4"}))
     monkeypatch.setattr(zd, "iter_recordings", listing)
     assert zd.main([]) == 2
     out = capsys.readouterr().out

@@ -115,15 +115,18 @@ class ZoomClient:
         raise RuntimeError(f"Gave up after {self.max_retries} attempts: {url}")
 
 
-def iter_recordings(client, start, end, user="me"):
-    """Yield one dict per completed MP4, walking date windows and result pages."""
+def iter_recordings(client, start, end, user="me", account=False):
+    """Yield one dict per completed MP4, walking date windows and result pages.
+
+    account=True lists every user's recordings via /accounts/me/recordings instead of one user's."""
+    url = f"{API}/accounts/me/recordings" if account else f"{API}/users/{user}/recordings"
     for w_start, w_end in date_windows(start, end):
         token = None
         while True:
             params = {"from": w_start.isoformat(), "to": w_end.isoformat(), "page_size": 300}
             if token:
                 params["next_page_token"] = token
-            body = client.request("GET", f"{API}/users/{user}/recordings", params=params).json()
+            body = client.request("GET", url, params=params).json()
             for m in body.get("meetings", []):
                 part = 0  # numbered within this one meeting, so it is stable across runs
                 for f in m.get("recording_files", []):
@@ -149,10 +152,14 @@ def slugify(text, max_len=60):
 
 
 def make_key(item):
-    """`<date>_<topic>_<meeting id>.mp4`; extra MP4s on one meeting (item["part"]) get `_1`, `_2`, ..."""
+    """`<date>_<HHMMSS>_<topic>_<meeting id>.mp4`; extra MP4s on one meeting (item["part"]) get `_1`, `_2`, ...
+
+    The start time keeps keys unique when a recurring meeting (same meeting id) is held twice in a day."""
     part = item.get("part", 0)
     suffix = f"_{part}" if part else ""
-    return f"{item['start_time'][:10]}_{slugify(item['topic'])}_{item['meeting_id']}{suffix}.mp4"
+    start = item["start_time"]  # e.g. 2026-09-29T15:03:04Z (UTC)
+    stamp = f"{start[:10]}_{start[11:19].replace(':', '')}"
+    return f"{stamp}_{slugify(item['topic'])}_{item['meeting_id']}{suffix}.mp4"
 
 
 def key_exists(s3, bucket, key):
@@ -254,6 +261,8 @@ def parse_args(argv=None):
     p.add_argument("--to", dest="end", type=date.fromisoformat, default=None,
                    help="last day to include, YYYY-MM-DD (default today)")
     p.add_argument("--user", default="me", help="Zoom user id or email whose recordings to list (default: me)")
+    p.add_argument("--account", action="store_true",
+                   help="list the whole account's recordings (/accounts/me/recordings) instead of one user's")
     p.add_argument("--limit", type=positive_int, default=None,
                    help="stop after N files, at least 1 (for testing); files skipped because they are "
                         "already in S3 count toward the limit")
@@ -306,7 +315,7 @@ def main(argv=None):
 
     auth = ZoomAuth(os.environ["ZOOM_ACCOUNT_ID"], os.environ["ZOOM_CLIENT_ID"], os.environ["ZOOM_CLIENT_SECRET"])
     client = ZoomClient(auth)
-    items = iter_recordings(client, args.start, end, user=args.user)
+    items = iter_recordings(client, args.start, end, user=args.user, account=args.account)
     if args.limit is not None:
         items = itertools.islice(items, args.limit)
 

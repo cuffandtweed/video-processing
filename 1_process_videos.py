@@ -131,8 +131,14 @@ def recover_finished(stem):
 
 
 def submit(key, stem):
-    """Start a job; if BDA reports its concurrent-job limit, wait for a slot and retry."""
+    """Start a job; if BDA reports its concurrent-job limit, wait for a slot and retry.
+
+    Returns the invocation ARN, or the finished result dict if an earlier job for this video completed
+    in the meantime (so waiting for a slot never causes a duplicate, paid job)."""
     while True:
+        finished = recover_finished(stem)
+        if finished is not None:
+            return finished
         try:
             resp = bda_rt.invoke_data_automation_async(
                 inputConfiguration={"s3Uri": f"s3://{BUCKET}/{key}"},
@@ -169,7 +175,12 @@ jobs = {}
 while pending or jobs:
     while pending and len(jobs) < MAX_JOBS:
         key, stem = pending.pop(0)
-        jobs[submit(key, stem)] = (key, stem)
+        started = submit(key, stem)
+        if isinstance(started, dict):
+            save_transcript(stem, started)
+            print(f"recovered finished output from an earlier run: {key}")
+            continue
+        jobs[started] = (key, stem)
         print(f"submitted: {key}")
     time.sleep(60)
     for arn in list(jobs):

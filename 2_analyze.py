@@ -11,7 +11,7 @@ Then download reports.zip (CloudShell: Actions > Download file > reports.zip).
 import os, re, sys, time, zipfile
 import boto3
 from botocore.config import Config
-from transcript_checks import has_speech, no_speech_report, quote_note
+from transcript_checks import batch_reports, has_speech, no_speech_report, quote_note
 
 REGION = "us-east-2"
 MODEL_ID = "us.anthropic.claude-opus-4-6-v1"
@@ -73,11 +73,43 @@ The 20-30 best quotes or moments across everything, with call filename, speaker,
 3-5 possible narrative throughlines the footage could support, each pointing to specific calls and moments."""
 
 
-def ask(prompt, text, max_tokens=16000):
+MERGE_PROMPT = """Below are partial master indexes for a documentary, each written from a different batch of recorded Zoom
+call reports. Merge them into ONE master index in Markdown with exactly these sections:
+
+## The calls
+One line per call across all batches: filename, who was in it, one-sentence summary. Keep every call.
+
+## Themes across all calls
+The recurring themes across the whole set, merging themes that appear in several batches, with which calls
+(and rough timestamps) best illustrate each.
+
+## People
+Every named person who appears in any batch, with which calls they're in and a one-line description of their
+role/perspective. Merge entries for the same person.
+
+## Strongest material
+The 20-30 best quotes or moments across everything, with call filename, speaker, and timestamp. Choose only from
+quotes that appear in the partial indexes and copy them exactly as written there; do not reword or invent any.
+
+## Suggested story threads
+3-5 possible narrative throughlines the footage could support, each pointing to specific calls and moments.
+
+Use only information in the partial indexes."""
+
+# Max characters of reports sent in one index request (about 125k tokens). Sending hundreds of KB at once
+# exceeds Bedrock's rate limit and the request is throttled; bigger sets are indexed in batches then merged.
+INDEX_BATCH_CHARS = 500_000
+
+# The master index can use a different model than the per-call reports (set INDEX_MODEL_ID), e.g. when the
+# report model has hit its daily token quota ("Too many tokens per day").
+INDEX_MODEL_ID = os.environ.get("INDEX_MODEL_ID") or MODEL_ID
+
+
+def ask(prompt, text, max_tokens=16000, model_id=None):
     for attempt in range(6):
         try:
             r = llm.converse(
-                modelId=MODEL_ID,
+                modelId=model_id or MODEL_ID,
                 messages=[{"role": "user", "content": [{"text": prompt + "\n\n---\n\n" + text}]}],
                 inferenceConfig={"maxTokens": max_tokens, "temperature": 0.3},
             )
@@ -146,9 +178,20 @@ for key in transcripts:
 if reports or silent:
     print("Building master index across all calls...")
     index = "# Master index — all calls\n\n"
+    if INDEX_MODEL_ID != MODEL_ID:
+        index += f"*This index was written by `{INDEX_MODEL_ID}`; the per-call reports were written by `{MODEL_ID}`.*\n\n"
     if reports:
-        combined = "\n\n\n".join(f"===== REPORT: {s} =====\n{r}" for s, r in reports)
-        body = ask(INDEX_PROMPT, combined, max_tokens=24000)
+        batches = batch_reports(reports, INDEX_BATCH_CHARS)
+        if len(batches) == 1:
+            body = ask(INDEX_PROMPT, "\n\n\n".join(batches[0]), max_tokens=24000, model_id=INDEX_MODEL_ID)
+        else:
+            partials = []
+            for i, batch in enumerate(batches, 1):
+                print(f"  index batch {i} of {len(batches)} ({len(batch)} calls)...")
+                partials.append(ask(INDEX_PROMPT, "\n\n\n".join(batch), max_tokens=24000, model_id=INDEX_MODEL_ID))
+            print("  merging the partial indexes...")
+            merged = "\n\n\n".join(f"===== PARTIAL INDEX {i} of {len(partials)} =====\n{p}" for i, p in enumerate(partials, 1))
+            body = ask(MERGE_PROMPT, merged, max_tokens=24000, model_id=INDEX_MODEL_ID)
         index += body + quote_note(body, "\n".join(texts[s] for s, _ in reports))
     if silent:
         index += "\n\n## Calls with no spoken content\n" + "\n".join(f"- `{s}`" for s, _ in silent) + "\n"

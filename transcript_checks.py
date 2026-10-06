@@ -82,3 +82,21 @@ def no_speech_report(stem):
             "The transcript for this recording contains no spoken words, only an automatic description of what is on "
             "screen. No participants, timeline, themes or quotes were generated, because doing so would mean "
             "inventing them. Check the recording itself if you expected conversation.\n")
+
+
+def batch_reports(reports, max_chars):
+    """Group (stem, report) pairs, in order, into batches of report blocks no larger than max_chars.
+
+    A report bigger than max_chars on its own still gets a batch of its own. Used to keep each master-index
+    request small enough for the model's rate limit when there are many calls."""
+    batches, current, size = [], [], 0
+    for stem, report in reports:
+        block = f"===== REPORT: {stem} =====\n{report}"
+        if current and size + len(block) > max_chars:
+            batches.append(current)
+            current, size = [], 0
+        current.append(block)
+        size += len(block)
+    if current:
+        batches.append(current)
+    return batches

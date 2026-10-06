@@ -114,6 +114,29 @@ def test_quote_note_empty_when_no_quotes():
     assert tc.quote_note("No quotes here.", SPOKEN) == ""
 
 
+def test_batch_reports_keeps_order_and_respects_the_size_limit():
+    reports = [(f"call_{i}", "x" * 100) for i in range(7)]
+    batches = tc.batch_reports(reports, max_chars=450)
+    assert [len(b) for b in batches] == [3, 3, 1]  # each block is ~118 chars, so 3 fit under 450
+    flat = [block for b in batches for block in b]
+    assert [blk.splitlines()[0] for blk in flat] == [f"===== REPORT: call_{i} =====" for i in range(7)]
+    assert all(sum(len(blk) for blk in b) <= 450 for b in batches)
+
+
+def test_batch_reports_single_batch_when_everything_fits():
+    batches = tc.batch_reports([("a", "text"), ("b", "text")], max_chars=10_000)
+    assert len(batches) == 1 and len(batches[0]) == 2
+
+
+def test_batch_reports_oversize_report_gets_its_own_batch():
+    batches = tc.batch_reports([("a", "x" * 50), ("big", "y" * 1000), ("c", "z" * 50)], max_chars=300)
+    assert [len(b) for b in batches] == [1, 1, 1]
+
+
+def test_batch_reports_empty_input():
+    assert tc.batch_reports([], max_chars=100) == []
+
+
 def test_no_speech_report_says_so_and_does_not_invent_content():
     r = tc.no_speech_report("call_1")
     assert r.startswith("# call_1")

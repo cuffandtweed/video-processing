@@ -84,6 +84,65 @@ def no_speech_report(stem):
             "inventing them. Check the recording itself if you expected conversation.\n")
 
 
+def collect_stream(events):
+    """Read a Bedrock converse_stream event stream; return (the reply text, the stop reason or None).
+
+    Streaming keeps data flowing during a long reply; one silent non-streaming request can be dropped by the
+    network (idle connection) and then hang until the read timeout. The stop reason is "max_tokens" when the
+    model ran out of output space and the reply is cut off."""
+    parts, stop_reason = [], None
+    for ev in events:
+        if "contentBlockDelta" in ev:
+            parts.append(ev["contentBlockDelta"]["delta"].get("text", ""))
+        elif "messageStop" in ev:
+            stop_reason = ev["messageStop"].get("stopReason")
+    return "".join(parts), stop_reason
+
+
+def collect_stream_text(events):
+    """Just the text of a converse_stream event stream (see collect_stream)."""
+    return collect_stream(events)[0]
+
+
+def cutoff_note(stop_reason):
+    """A visible warning to append to a reply that was cut off at the output limit; "" otherwise."""
+    if stop_reason != "max_tokens":
+        return ""
+    return ("\n\n> **WARNING: this reply was cut off because the model hit its output limit, so sections at the end "
+            "may be missing or incomplete.**")
+
+
+def is_daily_cap_error(error):
+    """True if a Bedrock error says the model's daily token quota is used up (waiting a few minutes won't help)."""
+    return "tokens per day" in str(error).lower()
+
+
+def model_note(used_model, primary_model):
+    """A line for the top of a report when a fallback model wrote it; "" when the primary model did."""
+    if used_model == primary_model:
+        return ""
+    return f"*Written by `{used_model}` (the primary model, `{primary_model}`, had reached its daily token limit).*\n\n"
+
+
+def cached_call(cache_dir, key_parts, fn):
+    """Return fn()'s text result, saving it under cache_dir keyed by a hash of key_parts.
+
+    If the same key_parts were saved by an earlier run, return that instead of calling fn() again. Nothing is
+    saved when fn() raises. Used so an interrupted master-index build repeats only the step that did not finish."""
+    import hashlib
+    import os
+    digest = hashlib.sha256("\x00".join(key_parts).encode("utf-8")).hexdigest()[:20]
+    path = os.path.join(cache_dir, digest + ".md")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    result = fn()
+    os.makedirs(cache_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(result)
+    return result
+
+
 def batch_reports(reports, max_chars):
     """Group (stem, report) pairs, in order, into batches of report blocks no larger than max_chars.
 

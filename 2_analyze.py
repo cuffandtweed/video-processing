@@ -11,10 +11,13 @@ Then download reports.zip (CloudShell: Actions > Download file > reports.zip).
 import os, re, sys, time, zipfile
 import boto3
 from botocore.config import Config
-from transcript_checks import batch_reports, has_speech, no_speech_report, quote_note
+from transcript_checks import (batch_reports, cached_call, collect_stream, cutoff_note, has_speech,
+                               is_daily_cap_error, model_note, no_speech_report, quote_note)
 
 REGION = "us-east-2"
-MODEL_ID = "us.anthropic.claude-opus-4-6-v1"
+# Set the MODEL_ID environment variable to use a different model, e.g. "us.anthropic.claude-opus-5" once the account
+# has access to it (today it returns "not available for this account").
+MODEL_ID = os.environ.get("MODEL_ID") or "us.anthropic.claude-opus-4-6-v1"
 
 if len(sys.argv) < 2:
     sys.exit("Usage: python3 2_analyze.py YOUR-BUCKET-NAME")
@@ -23,7 +26,7 @@ FILTER = sys.argv[2] if len(sys.argv) > 2 else None   # optional: only analyze t
 
 s3 = boto3.client("s3", region_name=REGION)
 # Long reports from a large model can take minutes; botocore's default 60s read timeout is too short.
-llm = boto3.client("bedrock-runtime", region_name=REGION, config=Config(read_timeout=900, retries={"max_attempts": 3}))
+llm = boto3.client("bedrock-runtime", region_name=REGION, config=Config(read_timeout=1800, retries={"max_attempts": 2}))
 
 REPORT_PROMPT = """You are a documentary story researcher. Below is an auto-generated transcript of a recorded Zoom call
 (speakers are labeled spk_0, spk_1, etc. — the labels are NOT names). If a Zoom transcript with real participant
@@ -103,18 +106,41 @@ INDEX_BATCH_CHARS = 500_000
 # The master index can use a different model than the per-call reports (set INDEX_MODEL_ID), e.g. when the
 # report model has hit its daily token quota ("Too many tokens per day").
 INDEX_MODEL_ID = os.environ.get("INDEX_MODEL_ID") or MODEL_ID
+# The final merge of partial indexes can use yet another model (set MERGE_MODEL_ID); saved batch results are reused.
+MERGE_MODEL_ID = os.environ.get("MERGE_MODEL_ID") or INDEX_MODEL_ID
+
+
+# When a model reports its daily token cap, later calls for it go to this fallback model for the rest of the run.
+FALLBACK_MODEL_ID = os.environ.get("FALLBACK_MODEL_ID") or "us.anthropic.claude-opus-4-5-20251101-v1:0"
+capped_models = set()   # models that have hit their daily cap during this run
+last_model_used = None  # which model wrote the most recent reply (so reports can say when a fallback did)
 
 
 def ask(prompt, text, max_tokens=16000, model_id=None):
+    global last_model_used
+    wanted = model_id or MODEL_ID
     for attempt in range(6):
+        model = FALLBACK_MODEL_ID if wanted in capped_models else wanted
         try:
-            r = llm.converse(
-                modelId=model_id or MODEL_ID,
+            # Stream the reply: a long non-streaming request sits silent and can be dropped by the network.
+            r = llm.converse_stream(
+                modelId=model,
                 messages=[{"role": "user", "content": [{"text": prompt + "\n\n---\n\n" + text}]}],
                 inferenceConfig={"maxTokens": max_tokens, "temperature": 0.3},
             )
-            return r["output"]["message"]["content"][0]["text"]
+            reply, stop_reason = collect_stream(r["stream"])
+            last_model_used = model
+            if stop_reason == "max_tokens":
+                print(f"  WARNING: a reply from {model} was cut off at the {max_tokens}-token output limit.")
+            return reply + cutoff_note(stop_reason)
         except Exception as e:
+            if is_daily_cap_error(e):
+                if model == FALLBACK_MODEL_ID:
+                    raise RuntimeError(f"Daily token cap reached on both {wanted} and the fallback {FALLBACK_MODEL_ID}; "
+                                       "try again tomorrow.") from e
+                print(f"  {model} has reached its daily token cap; using {FALLBACK_MODEL_ID} for the rest of this run.")
+                capped_models.add(wanted)
+                continue
             if "Throttl" in str(e) or "TooMany" in str(e):
                 time.sleep(15 * (attempt + 1)); continue
             raise
@@ -165,7 +191,8 @@ for key in transcripts:
             if vtt:
                 text += "\n\n=== ZOOM'S OWN TRANSCRIPT (has participant names) ===\n" + vtt
             print(f"analyzing: {stem} ...")
-            report = f"# {stem}\n\n" + ask(REPORT_PROMPT, text)
+            body = ask(REPORT_PROMPT, text)
+            report = f"# {stem}\n\n" + model_note(last_model_used, MODEL_ID) + body
             report += quote_note(report, transcript)
         else:
             print(f"no spoken content, not sending to the model: {stem}")
@@ -178,8 +205,9 @@ for key in transcripts:
 if reports or silent:
     print("Building master index across all calls...")
     index = "# Master index — all calls\n\n"
-    if INDEX_MODEL_ID != MODEL_ID:
-        index += f"*This index was written by `{INDEX_MODEL_ID}`; the per-call reports were written by `{MODEL_ID}`.*\n\n"
+    if INDEX_MODEL_ID != MODEL_ID or MERGE_MODEL_ID != MODEL_ID:
+        index += (f"*The per-call reports were written by `{MODEL_ID}`; this index was written by "
+                  f"`{INDEX_MODEL_ID}` (batches) and `{MERGE_MODEL_ID}` (final merge).*\n\n")
     if reports:
         batches = batch_reports(reports, INDEX_BATCH_CHARS)
         if len(batches) == 1:
@@ -188,10 +216,14 @@ if reports or silent:
             partials = []
             for i, batch in enumerate(batches, 1):
                 print(f"  index batch {i} of {len(batches)} ({len(batch)} calls)...")
-                partials.append(ask(INDEX_PROMPT, "\n\n\n".join(batch), max_tokens=24000, model_id=INDEX_MODEL_ID))
+                batch_text = "\n\n\n".join(batch)
+                partials.append(cached_call(
+                    "reports/.index_partials", (INDEX_MODEL_ID, INDEX_PROMPT, batch_text),
+                    lambda: ask(INDEX_PROMPT, batch_text, max_tokens=24000, model_id=INDEX_MODEL_ID)))
             print("  merging the partial indexes...")
             merged = "\n\n\n".join(f"===== PARTIAL INDEX {i} of {len(partials)} =====\n{p}" for i, p in enumerate(partials, 1))
-            body = ask(MERGE_PROMPT, merged, max_tokens=24000, model_id=INDEX_MODEL_ID)
+            # The merged index lists every call, so it needs room; the reply is streamed, so length is no timeout risk.
+            body = ask(MERGE_PROMPT, merged, max_tokens=40000, model_id=MERGE_MODEL_ID)
         index += body + quote_note(body, "\n".join(texts[s] for s, _ in reports))
     if silent:
         index += "\n\n## Calls with no spoken content\n" + "\n".join(f"- `{s}`" for s, _ in silent) + "\n"

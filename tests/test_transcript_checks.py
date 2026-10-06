@@ -137,6 +137,102 @@ def test_batch_reports_empty_input():
     assert tc.batch_reports([], max_chars=100) == []
 
 
+def test_cached_call_runs_once_then_reuses_the_saved_result(tmp_path):
+    calls = []
+
+    def fn():
+        calls.append(1)
+        return "partial index text"
+
+    first = tc.cached_call(str(tmp_path), ("model-a", "prompt", "batch text"), fn)
+    second = tc.cached_call(str(tmp_path), ("model-a", "prompt", "batch text"), fn)
+    assert first == second == "partial index text"
+    assert len(calls) == 1
+
+
+def test_cached_call_recomputes_when_any_input_changes(tmp_path):
+    calls = []
+
+    def fn():
+        calls.append(1)
+        return f"result {len(calls)}"
+
+    a = tc.cached_call(str(tmp_path), ("model-a", "prompt", "batch text"), fn)
+    b = tc.cached_call(str(tmp_path), ("model-b", "prompt", "batch text"), fn)   # different model
+    c = tc.cached_call(str(tmp_path), ("model-a", "prompt", "other batch"), fn)  # different batch
+    assert [a, b, c] == ["result 1", "result 2", "result 3"]
+
+
+def test_cached_call_does_not_save_when_the_call_fails(tmp_path):
+    def boom():
+        raise RuntimeError("throttled")
+
+    try:
+        tc.cached_call(str(tmp_path), ("m", "p", "t"), boom)
+    except RuntimeError:
+        pass
+    assert tc.cached_call(str(tmp_path), ("m", "p", "t"), lambda: "ok") == "ok"
+
+
+def test_collect_stream_text_joins_text_deltas_and_ignores_other_events():
+    events = [
+        {"messageStart": {"role": "assistant"}},
+        {"contentBlockDelta": {"delta": {"text": "Hello"}, "contentBlockIndex": 0}},
+        {"contentBlockDelta": {"delta": {"text": ", "}, "contentBlockIndex": 0}},
+        {"contentBlockDelta": {"delta": {"text": "world"}, "contentBlockIndex": 0}},
+        {"contentBlockStop": {"contentBlockIndex": 0}},
+        {"messageStop": {"stopReason": "end_turn"}},
+        {"metadata": {"usage": {"inputTokens": 5, "outputTokens": 3}}},
+    ]
+    assert tc.collect_stream_text(iter(events)) == "Hello, world"
+
+
+def test_collect_stream_reports_the_stop_reason():
+    done = [{"contentBlockDelta": {"delta": {"text": "a"}}}, {"messageStop": {"stopReason": "end_turn"}}]
+    cut = [{"contentBlockDelta": {"delta": {"text": "b"}}}, {"messageStop": {"stopReason": "max_tokens"}}]
+    assert tc.collect_stream(iter(done)) == ("a", "end_turn")
+    assert tc.collect_stream(iter(cut)) == ("b", "max_tokens")
+
+
+def test_collect_stream_without_a_stop_event_has_no_stop_reason():
+    assert tc.collect_stream(iter([{"contentBlockDelta": {"delta": {"text": "x"}}}])) == ("x", None)
+
+
+def test_cutoff_note_only_when_the_reply_hit_the_output_limit():
+    assert tc.cutoff_note("end_turn") == ""
+    assert tc.cutoff_note(None) == ""
+    note = tc.cutoff_note("max_tokens")
+    assert "cut off" in note.lower() and note.startswith("\n\n")
+
+
+def test_collect_stream_text_empty_stream_gives_empty_text():
+    assert tc.collect_stream_text(iter([])) == ""
+
+
+def test_collect_stream_text_skips_deltas_without_text():
+    events = [{"contentBlockDelta": {"delta": {"toolUse": {}}}}, {"contentBlockDelta": {"delta": {"text": "ok"}}}]
+    assert tc.collect_stream_text(events) == "ok"
+
+
+def test_is_daily_cap_error_matches_the_bedrock_daily_token_message():
+    msg = "ThrottlingException: Too many tokens per day, please wait before trying again."
+    assert tc.is_daily_cap_error(msg) is True
+    assert tc.is_daily_cap_error(RuntimeError(msg)) is True
+
+
+def test_is_daily_cap_error_ignores_ordinary_throttling_and_other_errors():
+    assert tc.is_daily_cap_error("ThrottlingException: Too many requests, please wait") is False
+    assert tc.is_daily_cap_error("ReadTimeoutError: Read timeout on endpoint URL") is False
+    assert tc.is_daily_cap_error("") is False
+
+
+def test_model_note_only_when_a_different_model_wrote_it():
+    assert tc.model_note("model-a", "model-a") == ""
+    note = tc.model_note("model-b", "model-a")
+    assert "model-b" in note and "model-a" in note
+    assert note.endswith("\n\n")
+
+
 def test_no_speech_report_says_so_and_does_not_invent_content():
     r = tc.no_speech_report("call_1")
     assert r.startswith("# call_1")

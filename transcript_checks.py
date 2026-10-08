@@ -112,6 +112,29 @@ def cutoff_note(stop_reason):
             "may be missing or incomplete.**")
 
 
+_MODEL_TAG = re.compile(r"^<!-- written-by: (.+?) -->", re.M)
+
+
+def tag_model(text, model):
+    """Prefix a saved piece of model output with the model that wrote it, so a reused cache entry still says."""
+    return f"<!-- written-by: {model} -->\n{text}"
+
+
+def tagged_models(texts):
+    """The set of models named in tag_model() markers across the given texts."""
+    return {m.group(1) for t in texts for m in [_MODEL_TAG.search(t)] if m}
+
+
+def index_model_note(models_used, primary_model):
+    """A line for the top of the master index when models other than the primary wrote any of it."""
+    others = sorted(m for m in models_used if m != primary_model)
+    if not others:
+        return ""
+    listed = ", ".join(f"`{m}`" for m in others)
+    return (f"*The per-call reports were written by `{primary_model}`; parts of this index were written by "
+            f"{listed}.*\n\n")
+
+
 def is_daily_cap_error(error):
     """True if a Bedrock error says the model's daily token quota is used up (waiting a few minutes won't help)."""
     return "tokens per day" in str(error).lower()

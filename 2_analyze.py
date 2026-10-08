@@ -12,7 +12,8 @@ import os, re, sys, time, zipfile
 import boto3
 from botocore.config import Config
 from transcript_checks import (batch_reports, cached_call, collect_stream, cutoff_note, has_speech,
-                               is_daily_cap_error, model_note, no_speech_report, quote_note)
+                               index_model_note, is_daily_cap_error, model_note, no_speech_report, quote_note,
+                               tag_model, tagged_models)
 
 REGION = "us-east-2"
 # Set the MODEL_ID environment variable to use a different model, e.g. "us.anthropic.claude-opus-5" once the account
@@ -205,13 +206,12 @@ for key in transcripts:
 if reports or silent:
     print("Building master index across all calls...")
     index = "# Master index — all calls\n\n"
-    if INDEX_MODEL_ID != MODEL_ID or MERGE_MODEL_ID != MODEL_ID:
-        index += (f"*The per-call reports were written by `{MODEL_ID}`; this index was written by "
-                  f"`{INDEX_MODEL_ID}` (batches) and `{MERGE_MODEL_ID}` (final merge).*\n\n")
     if reports:
         batches = batch_reports(reports, INDEX_BATCH_CHARS)
+        models_used = set()   # every model that wrote any part of the index, including cached batches from earlier runs
         if len(batches) == 1:
             body = ask(INDEX_PROMPT, "\n\n\n".join(batches[0]), max_tokens=24000, model_id=INDEX_MODEL_ID)
+            models_used.add(last_model_used)
         else:
             partials = []
             for i, batch in enumerate(batches, 1):
@@ -219,11 +219,15 @@ if reports or silent:
                 batch_text = "\n\n\n".join(batch)
                 partials.append(cached_call(
                     "reports/.index_partials", (INDEX_MODEL_ID, INDEX_PROMPT, batch_text),
-                    lambda: ask(INDEX_PROMPT, batch_text, max_tokens=24000, model_id=INDEX_MODEL_ID)))
+                    lambda: tag_model(ask(INDEX_PROMPT, batch_text, max_tokens=24000, model_id=INDEX_MODEL_ID),
+                                      last_model_used)))
+            models_used |= tagged_models(partials)
             print("  merging the partial indexes...")
             merged = "\n\n\n".join(f"===== PARTIAL INDEX {i} of {len(partials)} =====\n{p}" for i, p in enumerate(partials, 1))
             # The merged index lists every call, so it needs room; the reply is streamed, so length is no timeout risk.
             body = ask(MERGE_PROMPT, merged, max_tokens=40000, model_id=MERGE_MODEL_ID)
+            models_used.add(last_model_used)
+        index += index_model_note(models_used, MODEL_ID)
         index += body + quote_note(body, "\n".join(texts[s] for s, _ in reports))
     if silent:
         index += "\n\n## Calls with no spoken content\n" + "\n".join(f"- `{s}`" for s, _ in silent) + "\n"

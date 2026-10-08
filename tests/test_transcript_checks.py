@@ -214,6 +214,30 @@ def test_collect_stream_text_skips_deltas_without_text():
     assert tc.collect_stream_text(events) == "ok"
 
 
+def test_tag_model_then_tagged_models_round_trips():
+    a = tc.tag_model("partial index A", "model-a")
+    b = tc.tag_model("partial index B", "model-b")
+    assert "partial index A" in a and a != "partial index A"
+    assert tc.tagged_models([a, b, "untagged text"]) == {"model-a", "model-b"}
+
+
+def test_tagged_models_empty_when_nothing_is_tagged():
+    assert tc.tagged_models(["plain", "text"]) == set()
+
+
+def test_index_model_note_is_empty_when_only_the_primary_model_was_used():
+    assert tc.index_model_note({"primary"}, "primary") == ""
+    assert tc.index_model_note(set(), "primary") == ""
+
+
+def test_index_model_note_names_the_other_models_that_wrote_parts_of_the_index():
+    note = tc.index_model_note({"primary", "fallback-b", "fallback-a"}, "primary")
+    assert "fallback-a" in note and "fallback-b" in note and "primary" in note
+    assert note.endswith("\n\n")
+    # the primary model is not listed as a "different" model
+    assert note.index("fallback-a") < note.index("fallback-b")
+
+
 def test_is_daily_cap_error_matches_the_bedrock_daily_token_message():
     msg = "ThrottlingException: Too many tokens per day, please wait before trying again."
     assert tc.is_daily_cap_error(msg) is True

@@ -24,6 +24,7 @@ import boto3
 from botocore.config import Config
 
 import moments as mo
+from moments_html import write_html
 from transcript_checks import collect_stream, quote_in_transcript
 
 REGION = "us-east-2"
@@ -57,12 +58,24 @@ laughter = shared laughter or banter; breakthrough = an insight, a decision, an 
 tension = awkwardness or strain. Do not invent anything. If nothing stands out, return an empty "moments" list.
 Never guess people's names; refer to speakers by their labels.
 
+Vocabulary this company uses (use it to understand the conversation; do not repeat it back):
+GLOSSARY_HERE
+
 TRANSCRIPT:
 """
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+def load_glossary(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), "glossary.txt")):
+    """The company's own names for its products and projects, so the model does not guess what they mean."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return "(none provided)"
 
 
 def fetch_json(s3, stem):
@@ -80,7 +93,7 @@ def fetch_json(s3, stem):
 def ask_model(llm, text):
     r = llm.converse_stream(
         modelId=MODEL_ID,
-        messages=[{"role": "user", "content": [{"text": PROMPT + text}]}],
+        messages=[{"role": "user", "content": [{"text": PROMPT.replace("GLOSSARY_HERE", load_glossary()) + text}]}],
         inferenceConfig={"maxTokens": 8000, "temperature": 0.2},
     )
     reply, stop = collect_stream(r["stream"])
@@ -126,11 +139,18 @@ CLUSTER_PROMPT = """Below are topic names taken from many recorded work conversa
 appears under different names. Group the names into canonical topics so that the same subject gets ONE name.
 
 Rules:
-- Aim for roughly 1 canonical topic per 5 to 15 names; do not leave most names alone.
-- A canonical topic is a short, clear name of 1 to 4 words (a product, project, person-neutral subject or activity).
+- Aim for roughly 1 canonical topic per 3 to 10 names; do not leave most names alone, but NEVER merge unrelated
+  subjects just to reduce the count. When in doubt, keep them separate.
+- A canonical topic is a short, clear name of 1 to 4 words (a product, project, subject or activity).
+- Topics about one of the company's products or projects (see the vocabulary below) get that product's name.
+- Personal and emotional subjects (family, health, grief, pets, life events) must NOT be hidden in a generic
+  bucket: give them their own specific canonical topics, such as "Grief and loss" or "Family and parenting".
+  Light banter and jokes can go in "Humor and banter". Do not use a catch-all like "Small talk".
 - Every name must appear in exactly one group, copied exactly as given.
-- Names that are one-off chit-chat can go in a group called "Small talk".
 - Reuse these existing canonical topics when they fit: {existing}
+
+Vocabulary this company uses (names may be spelled or phrased differently from these):
+{glossary}
 
 Return ONE JSON object, nothing else: {{"topics": [{{"canonical": "name", "names": ["...", "..."]}}]}}
 
@@ -144,7 +164,8 @@ def cluster_topics(llm, topics, batch_size=400):
     mapping, canonical = {}, []
     for batch in mo.batch_names([t.get("topic", "") for t in topics], batch_size):
         log(f"  clustering {len(batch)} topic names...")
-        prompt = CLUSTER_PROMPT.format(existing=", ".join(canonical) or "(none yet)", names="\n".join(batch))
+        prompt = CLUSTER_PROMPT.format(existing=", ".join(canonical) or "(none yet)", names="\n".join(batch),
+                                       glossary=load_glossary())
         r = llm.converse_stream(modelId=MODEL_ID, messages=[{"role": "user", "content": [{"text": prompt}]}],
                                 inferenceConfig={"maxTokens": 16000, "temperature": 0.0})
         reply, stop = collect_stream(r["stream"])
@@ -184,6 +205,10 @@ def write_outputs(results, topic_map):
             f.write(f"\n## {stem}\n\n")
             for m in mo.rank_moments(r["moments"], top_n=15):
                 f.write(line(m) + "\n")
+
+    # The page for skimming: moments and topics only, with readable call names and the video file to look in.
+    page = write_html(OUT, mo.rank_moments(all_moments), all_topics)
+    log(f"  skimmable page: {page}")
 
     by_topic = {}
     for t in all_topics:

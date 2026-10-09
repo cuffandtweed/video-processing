@@ -214,6 +214,26 @@ def test_collect_stream_text_skips_deltas_without_text():
     assert tc.collect_stream_text(events) == "ok"
 
 
+def test_quote_in_transcript_matches_ignoring_case_punctuation_and_line_prefixes():
+    transcript = ("[00:01:31] spk_0: Um, I was just offering this to everybody.\n"
+                  "[00:01:34] spk_0: We have $64,000 in AWS credits that are expiring in two days.\n")
+    assert tc.quote_in_transcript("we have $64,000 in aws credits that are expiring in two days", transcript)
+    assert tc.quote_in_transcript("I was just offering this to everybody. We have $64,000 in AWS credits", transcript)
+    assert tc.quote_in_transcript("offering this", transcript)   # short quotes are checked too
+
+
+def test_quote_in_transcript_rejects_invented_text_and_empty_quotes():
+    assert not tc.quote_in_transcript("Mindfulness isn't just a practice", SPOKEN)
+    assert not tc.quote_in_transcript("", SPOKEN)
+    assert not tc.quote_in_transcript("   ", SPOKEN)
+
+
+def test_quote_in_transcript_checks_each_side_of_an_ellipsis():
+    transcript = "[00:00:01] spk_0: We have credits that are expiring in two days and nobody wants them at all."
+    assert tc.quote_in_transcript("We have credits that are expiring ... nobody wants them at all.", transcript)
+    assert not tc.quote_in_transcript("We have credits that are expiring ... the moon is cheese.", transcript)
+
+
 def test_tag_model_then_tagged_models_round_trips():
     a = tc.tag_model("partial index A", "model-a")
     b = tc.tag_model("partial index B", "model-b")

@@ -63,6 +63,15 @@ def check_quotes(markdown, transcript):
     return total, missing
 
 
+def quote_in_transcript(quote, transcript):
+    """True if one quote appears word for word in the transcript (case, punctuation and "[time] spk:" prefixes
+    ignored). A quote with an ellipsis must have every part present."""
+    haystack = _norm(_LINE_PREFIX.sub("", transcript))
+    parts = [_norm(p) for p in _ELLIPSIS.split(quote)]
+    parts = [p for p in parts if p]
+    return bool(parts) and all(p in haystack for p in parts)
+
+
 def quote_note(markdown, transcript):
     """Markdown to append to a report: a quote-check result, or "" when it has no checkable quotes."""
     total, missing = check_quotes(markdown, transcript)

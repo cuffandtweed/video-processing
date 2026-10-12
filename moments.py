@@ -146,6 +146,27 @@ def build_topic_map(reply):
     return mapping
 
 
+def parse_cluster_text(text):
+    """{lowercased name: canonical topic} from a plain-text answer of "## Topic" lines followed by "- name" lines.
+
+    Plain text cannot break the way JSON does when a topic name contains quotation marks."""
+    mapping, canonical = {}, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("## "):
+            canonical = line[3:].strip()
+        elif canonical and (line.startswith("- ") or line.startswith("* ")):
+            name = line[2:].strip().lower()
+            if name and name not in mapping:
+                mapping[name] = canonical
+    return mapping
+
+
+def unplaced_names(names, mapping):
+    """The names (lowercased) that the model's grouping did not assign to any topic."""
+    return [n for n in (str(x).strip().lower() for x in names) if n not in mapping]
+
+
 def apply_topic_map(topics, mapping):
     """Add a "canonical" name to each topic; a topic the model did not place keeps its own name."""
     out = []
@@ -164,6 +185,26 @@ def batch_names(names, size):
             seen.add(key)
             unique.append(key)
     return [unique[i:i + size] for i in range(0, len(unique), size)]
+
+
+def has_enough_speech(segments, min_chars=200):
+    """False for a call with only a stray word or two ("uh, I'll, um"): there is nothing for a model to read."""
+    return sum(len(s["text"]) for s in segments) >= min_chars
+
+
+def cache_key(*parts):
+    """A short stable name for saved results: it changes whenever the model, prompt or glossary changes,
+    so old saved results are never reused after the instructions have been edited."""
+    import hashlib
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()[:10]
+
+
+def first_available_model(chain, capped):
+    """The first model in the preference order that has not hit its daily cap; None if all have."""
+    for model in chain:
+        if model not in capped:
+            return model
+    return None
 
 
 def rank_moments(moments, top_n=None):

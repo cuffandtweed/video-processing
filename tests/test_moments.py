@@ -213,6 +213,59 @@ def test_batch_names_splits_into_chunks_keeping_order_and_dropping_duplicates():
     assert m.batch_names([], size=5) == []
 
 
+def test_parse_cluster_text_reads_headings_and_bulleted_names():
+    text = ('Here are the groups:\n\n## Miranda\n- miranda homepage\n- Miranda installs\n\n'
+            '## AWS credits\n* aws credits expiring\n- a name with "quotes" and, commas\n')
+    mp = m.parse_cluster_text(text)
+    assert mp == {"miranda homepage": "Miranda", "miranda installs": "Miranda",
+                  "aws credits expiring": "AWS credits", 'a name with "quotes" and, commas': "AWS credits"}
+
+
+def test_parse_cluster_text_ignores_names_before_any_heading_and_blank_lines():
+    assert m.parse_cluster_text("- orphan name\n\n## Real topic\n\n- a name\n") == {"a name": "Real topic"}
+    assert m.parse_cluster_text("") == {}
+
+
+def test_parse_cluster_text_first_group_wins_when_a_name_is_listed_twice():
+    text = "## One\n- same name\n## Two\n- same name\n"
+    assert m.parse_cluster_text(text) == {"same name": "One"}
+
+
+def test_unplaced_names_are_those_the_model_did_not_assign():
+    mapping = {"a": "Topic", "b": "Topic"}
+    assert m.unplaced_names(["a", "b", "c", "D"], mapping) == ["c", "d"]
+    assert m.unplaced_names(["a"], mapping) == []
+
+
+def test_has_enough_speech_rejects_a_few_stray_words():
+    stray = [{"start_ms": 0, "end_ms": 900, "speaker": "spk_0", "text": "Uh, I'll, um,"}]
+    assert m.has_enough_speech(stray, min_chars=200) is False
+    assert m.has_enough_speech([], min_chars=200) is False
+
+
+def test_has_enough_speech_accepts_a_real_conversation():
+    talk = [{"start_ms": i * 1000, "end_ms": i * 1000 + 900, "speaker": "spk_0", "text": "x" * 60} for i in range(5)]
+    assert m.has_enough_speech(talk, min_chars=200) is True    # 300 characters
+    assert m.has_enough_speech(talk, min_chars=400) is False
+
+
+def test_cache_key_is_stable_and_changes_with_any_input():
+    a = m.cache_key("model-a", "prompt", "glossary")
+    assert a == m.cache_key("model-a", "prompt", "glossary")
+    assert len(a) == 10 and all(c in "0123456789abcdef" for c in a)
+    assert a != m.cache_key("model-b", "prompt", "glossary")
+    assert a != m.cache_key("model-a", "prompt v2", "glossary")
+    assert a != m.cache_key("model-a", "prompt", "glossary changed")
+
+
+def test_first_available_model_skips_capped_models_in_order():
+    chain = ["a", "b", "c"]
+    assert m.first_available_model(chain, set()) == "a"
+    assert m.first_available_model(chain, {"a"}) == "b"
+    assert m.first_available_model(chain, {"a", "b"}) == "c"
+    assert m.first_available_model(chain, {"a", "b", "c"}) is None
+
+
 def test_clock_formats_milliseconds_as_hh_mm_ss():
     assert m.clock(0) == "00:00:00"
     assert m.clock(3_725_000) == "01:02:05"

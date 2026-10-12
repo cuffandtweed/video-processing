@@ -56,6 +56,77 @@ def test_rebuild_from_json_files_writes_the_page(tmp_path):
     assert "Eng Standup" in (tmp_path / "moments.html").read_text(encoding="utf-8")
 
 
+STEM = "2026-07-22_152953_eng_standup_95311646981"
+
+
+def test_build_links_for_google_drive_search():
+    links = h.build_links([STEM], "drive")
+    assert links[STEM] == f"https://drive.google.com/drive/search?q={STEM}.mp4"
+
+
+def test_build_links_for_a_local_windows_folder():
+    links = h.build_links([STEM], "local", "D:\\Footage\\Calls")
+    assert links[STEM] == f"file:///D:/Footage/Calls/{STEM}.mp4"
+
+
+def test_build_links_for_a_relative_folder_next_to_the_page():
+    assert h.build_links([STEM], "local", "videos")[STEM] == f"videos/{STEM}.mp4"
+    assert h.build_links([STEM], "local", "videos/")[STEM] == f"videos/{STEM}.mp4"
+
+
+def test_build_links_encodes_spaces_and_special_characters_in_names():
+    links = h.build_links(["a b&c"], "drive")
+    assert "a%20b%26c.mp4" in links["a b&c"]
+
+
+def test_build_links_none_mode_gives_no_links():
+    assert h.build_links([STEM], "none") == {}
+
+
+def test_build_html_with_links_embeds_them_and_a_button_label():
+    moments = [{"call": STEM, "timestamp": "00:05:56", "type": "humor", "score": 3, "quote": "q", "why": "w",
+                "source": "model", "verbatim": "yes"}]
+    page = h.build_html(moments, [], links=h.build_links([STEM], "drive"), link_label="Open in Drive")
+    assert "drive.google.com/drive/search?q=" in page and "Open in Drive" in page
+    plain = h.build_html(moments, [])
+    assert "drive.google.com" not in plain
+
+
+def test_rebuild_with_a_link_mode_writes_the_named_page(tmp_path):
+    import json
+    moments = [{"call": STEM, "timestamp": "00:05:56", "type": "humor", "score": 3, "quote": "ha", "why": "funny",
+                "source": "model", "verbatim": "yes"}]
+    (tmp_path / "moments.json").write_text(json.dumps(moments), encoding="utf-8")
+    (tmp_path / "topics.json").write_text("[]", encoding="utf-8")
+    path = h.rebuild(str(tmp_path), mode="local", base="D:\\Footage", filename="moments_local.html")
+    assert os.path.basename(path) == "moments_local.html"
+    assert "file:///D:/Footage/" in (tmp_path / "moments_local.html").read_text(encoding="utf-8")
+
+
+def test_the_command_line_builds_a_page_and_a_failure_leaves_no_empty_file(tmp_path):
+    import json
+    import subprocess
+    moments = [{"call": STEM, "timestamp": "00:05:56", "type": "humor", "score": 4, "quote": "ha", "why": "funny",
+                "source": "model", "verbatim": "yes"}]
+    (tmp_path / "moments.json").write_text(json.dumps(moments), encoding="utf-8")
+    (tmp_path / "topics.json").write_text("[]", encoding="utf-8")
+    script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "moments_html.py")
+    done = subprocess.run([sys.executable, script, str(tmp_path), "--links", "drive", "--name", "page.html"],
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    page = (tmp_path / "page.html").read_text(encoding="utf-8")
+    assert "drive.google.com/drive/search" in page and len(page) > 5000
+
+
+def test_a_failed_build_does_not_overwrite_an_existing_page(tmp_path):
+    (tmp_path / "keep.html").write_text("original page", encoding="utf-8")
+    try:
+        h.write_html(str(tmp_path), [], [], links={STEM: object()}, filename="keep.html")   # cannot be turned into JSON
+    except TypeError:
+        pass
+    assert (tmp_path / "keep.html").read_text(encoding="utf-8") == "original page"
+
+
 def test_script_safe_json_never_contains_a_closing_script_tag():
     out = h.script_safe_json({"quote": "</script><b>hi</b>"})
     assert "</script" not in out

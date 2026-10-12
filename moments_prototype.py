@@ -19,19 +19,24 @@ import csv
 import json
 import os
 import sys
+import time
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import boto3
 from botocore.config import Config
 
 import moments as mo
 from moments_html import write_html
-from transcript_checks import collect_stream, quote_in_transcript
+from transcript_checks import cached_call, collect_stream, is_daily_cap_error, quote_in_transcript
 
 REGION = "us-east-2"
 BUCKET = "sandgarden-zoom-uploads"
 MODEL_ID = os.environ.get("MOMENTS_MODEL_ID") or "us.anthropic.claude-sonnet-4-6"
 OUT = "moments_proto"
+WORKERS = int(os.environ.get("MOMENTS_WORKERS") or 4)   # how many calls to analyze at the same time
 MIN_PAUSE_S = 4.0
+MIN_SPEECH_CHARS = 200   # a call with less spoken text than this is treated as having no usable speech
 MIN_OVERLAP_MS = 800
 
 PROMPT = """You are helping a documentary editor find the best material in a recorded Zoom call. Below is the transcript.
@@ -90,33 +95,58 @@ def fetch_json(s3, stem):
         return json.load(f)
 
 
+# Preferred model first. If one reports "Too many tokens per day", the next is used for the rest of the run.
+MODEL_CHAIN = [MODEL_ID, "us.anthropic.claude-sonnet-4-5-20250929-v1:0", "us.anthropic.claude-haiku-4-5-20251001-v1:0"]
+capped_models = set()
+
+
 def ask_model(llm, text):
-    r = llm.converse_stream(
-        modelId=MODEL_ID,
-        messages=[{"role": "user", "content": [{"text": PROMPT.replace("GLOSSARY_HERE", load_glossary()) + text}]}],
-        inferenceConfig={"maxTokens": 8000, "temperature": 0.2},
-    )
-    reply, stop = collect_stream(r["stream"])
-    if stop == "max_tokens":
-        log("  WARNING: the reply was cut off at the output limit")
-    return reply
+    """Returns (the model's reply, which model wrote it)."""
+    for attempt in range(6):
+        model = mo.first_available_model(MODEL_CHAIN, capped_models)
+        if model is None:
+            raise RuntimeError("Every model in the fallback chain has reached its daily token cap; try again tomorrow.")
+        try:
+            r = llm.converse_stream(
+                modelId=model,
+                messages=[{"role": "user", "content": [{"text": PROMPT.replace("GLOSSARY_HERE", load_glossary()) + text}]}],
+                inferenceConfig={"maxTokens": 8000, "temperature": 0.2},
+            )
+            reply, stop = collect_stream(r["stream"])
+            if stop == "max_tokens":
+                log("  WARNING: the reply was cut off at the output limit")
+            return reply, model
+        except Exception as e:
+            if is_daily_cap_error(e):
+                capped_models.add(model)
+                log(f"  {model} has reached its daily token cap; switching to the next model in the chain")
+                continue
+            if "Throttl" in str(e):
+                time.sleep(15 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError("Gave up after repeated throttling")
 
 
 def analyze_call(llm, s3, stem):
     result = fetch_json(s3, stem)
     segments = mo.load_segments(result)
-    if not segments:
-        log(f"  no spoken content: {stem}")
+    if not mo.has_enough_speech(segments, MIN_SPEECH_CHARS):
+        log(f"  no usable speech ({len(segments)} segment(s)): {stem}")
         return None
     pauses = mo.find_pauses(segments, MIN_PAUSE_S)
     # Talking-over is not used: BDA's speaker segments never overlap, so interruptions are invisible in this data.
     transcript = mo.format_transcript(segments, pauses, [])
-    log(f"  {len(segments)} segments, {len(pauses)} silences >= {MIN_PAUSE_S:g}s; asking {MODEL_ID}...")
+    log(f"  {len(segments)} segments, {len(pauses)} silences >= {MIN_PAUSE_S:g}s; asking the model...")
+    degraded = False
+    model_used = None
     try:
-        data = mo.parse_model_json(ask_model(llm, transcript))
+        reply, model_used = ask_model(llm, transcript)
+        data = mo.parse_model_json(reply)
     except ValueError as e:
         log(f"  could not read the model's answer ({e}); keeping the timing signals only")
         data = {"topics": [], "moments": []}
+        degraded = True
 
     found = []
     for item in data.get("moments", []):
@@ -132,7 +162,39 @@ def analyze_call(llm, s3, stem):
     for s in mo.silence_moments(pauses, flagged, stem):
         found.append({**s, "verbatim": "n/a"})
     topics = [{**t, "call": stem} for t in data.get("topics", [])]
-    return {"moments": found, "topics": topics, "segments": len(segments)}
+    return {"moments": found, "topics": topics, "segments": len(segments), "model": model_used, "degraded": degraded}
+
+
+def cache_dir():
+    """Saved per-call results live in a folder named for the model, prompt and glossary, so editing any of them
+    starts fresh instead of reusing results made under the old instructions."""
+    return os.path.join(OUT, "calls", mo.cache_key(MODEL_ID, PROMPT, load_glossary()))
+
+
+def analyze_call_saved(llm, s3, stem):
+    """analyze_call, but a finished call is saved and reused, so an interrupted run resumes where it stopped."""
+    path = os.path.join(cache_dir(), f"{stem}.json")
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            saved = json.load(f)
+        return None if saved.get("skip") else saved
+    result = analyze_call(llm, s3, stem)
+    if result is None or not result.get("degraded"):   # a call whose answer could not be read is retried next time
+        os.makedirs(cache_dir(), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(result if result else {"skip": True}, f, ensure_ascii=False)
+    return result
+
+
+def list_all_stems(s3):
+    """Every call that has a saved BDA result in the bucket."""
+    stems = []
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=BUCKET, Prefix="transcripts/"):
+        for o in page.get("Contents", []):
+            name = o["Key"].rsplit("/", 1)[-1]
+            if name.endswith(".json") and name.startswith("2026-"):
+                stems.append(name[:-5])
+    return sorted(stems)
 
 
 CLUSTER_PROMPT = """Below are topic names taken from many recorded work conversations at one company. The same subject often
@@ -152,32 +214,59 @@ Rules:
 Vocabulary this company uses (names may be spelled or phrased differently from these):
 {glossary}
 
-Return ONE JSON object, nothing else: {{"topics": [{{"canonical": "name", "names": ["...", "..."]}}]}}
+Answer in plain text only, in exactly this format and nothing else: for each group, a line "## Canonical topic name",
+then one line per topic name in that group, written "- name" (copied exactly as given). Example:
+
+## Miranda
+- miranda homepage
+- miranda cost tracking demo
 
 TOPIC NAMES:
 {names}
 """
 
 
-def cluster_topics(llm, topics, batch_size=400):
-    """Merge per-call topic names into shared canonical topics. Returns {lowercased name: canonical}."""
-    mapping, canonical = {}, []
-    for batch in mo.batch_names([t.get("topic", "") for t in topics], batch_size):
-        log(f"  clustering {len(batch)} topic names...")
-        prompt = CLUSTER_PROMPT.format(existing=", ".join(canonical) or "(none yet)", names="\n".join(batch),
-                                       glossary=load_glossary())
+def _cluster_batch(llm, names, existing):
+    """One grouping request for a batch of topic names; the answer is saved, so a rerun does not repeat it."""
+    prompt = CLUSTER_PROMPT.format(existing=", ".join(existing) or "(none yet)", names="\n".join(names),
+                                   glossary=load_glossary())
+
+    def ask():
         r = llm.converse_stream(modelId=MODEL_ID, messages=[{"role": "user", "content": [{"text": prompt}]}],
                                 inferenceConfig={"maxTokens": 16000, "temperature": 0.0})
         reply, stop = collect_stream(r["stream"])
         if stop == "max_tokens":
-            log("  WARNING: the clustering reply was cut off; unplaced names keep their own name")
-        try:
-            part = mo.build_topic_map(mo.parse_model_json(reply))
-        except ValueError as e:
-            log(f"  could not read the clustering answer ({e}); this batch keeps its own names")
-            continue
-        mapping.update(part)
-        canonical = sorted(set(canonical) | set(part.values()))
+            raise RuntimeError("the grouping reply was cut off at the output limit")
+        return reply
+
+    return mo.parse_cluster_text(cached_call(os.path.join(OUT, "clusters"), (MODEL_ID, prompt), ask))
+
+
+def cluster_topics(llm, topics, batch_size=150):
+    """Merge per-call topic names into shared canonical topics. Returns {lowercased name: canonical}.
+
+    Names the model skips get a second pass; any still left over keep their own name."""
+    all_names = [n for batch in mo.batch_names([t.get("topic", "") for t in topics], 10 ** 9) for n in batch]
+    mapping, canonical = {}, []
+
+    def run(names):
+        nonlocal canonical
+        for i in range(0, len(names), batch_size):
+            batch = names[i:i + batch_size]
+            log(f"  grouping {len(batch)} topic names ({i + len(batch)} of {len(names)})...")
+            part = _cluster_batch(llm, batch, canonical)
+            for name, topic in part.items():
+                mapping.setdefault(name, topic)
+            canonical = sorted(set(canonical) | set(part.values()))
+
+    run(all_names)
+    left = mo.unplaced_names(all_names, mapping)
+    if left:
+        log(f"  {len(left)} names were not placed in a group; asking again for those")
+        run(left)
+    still = mo.unplaced_names(all_names, mapping)
+    log(f"  topic names grouped: {len(all_names) - len(still)} of {len(all_names)}, into {len(set(mapping.values()))} topics; "
+        f"{len(still)} keep their own name")
     return mapping
 
 
@@ -229,20 +318,44 @@ def write_outputs(results, topic_map):
 def main(stems):
     s3 = boto3.client("s3", region_name=REGION)
     llm = boto3.client("bedrock-runtime", region_name=REGION, config=Config(read_timeout=600, retries={"max_attempts": 2}))
-    results = {}
-    for stem in stems:
-        log(f"analyzing {stem}")
-        r = analyze_call(llm, s3, stem)
-        if r:
-            results[stem] = r
+    if stems == ["--all"]:
+        stems = list_all_stems(s3)
+        log(f"{len(stems)} calls have saved BDA data")
+    results, failed = {}, []
+    done = 0
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:   # a few calls at a time; each saves its own result
+        futures = {pool.submit(analyze_call_saved, llm, s3, stem): stem for stem in stems}
+        for fut in as_completed(futures):
+            stem = futures[fut]
+            done += 1
+            try:
+                r = fut.result()
+            except Exception as e:   # one bad call must not stop the other hundreds
+                log(f"[{done}/{len(stems)}] FAILED {stem}: {type(e).__name__}: {str(e)[:200]}")
+                failed.append(stem)
+                continue
+            log(f"[{done}/{len(stems)}] done {stem}")
+            if r:
+                results[stem] = r
+    results = {s: results[s] for s in stems if s in results}   # keep the outputs in a stable order
     topic_map = cluster_topics(llm, [t for r in results.values() for t in r["topics"]])
     write_outputs(results, topic_map)
     total = sum(len(r["moments"]) for r in results.values())
     bad = sum(1 for r in results.values() for m in r["moments"] if m["verbatim"] == "NO")
-    log(f"\nDone: {len(results)} calls, {total} moments ({bad} model quotes not found verbatim). Files are in {OUT}/")
+    degraded = sum(1 for r in results.values() if r.get("degraded"))
+    models = sorted({r.get("model") for r in results.values() if r.get("model")})
+    log(f"\nDone: {len(results)} calls with speech, {total} moments ({bad} model quotes not found verbatim), "
+        f"{degraded} calls where the model's answer could not be read, models used: {', '.join(models) or 'none'}. "
+        f"Files are in {OUT}/")
+    if failed:
+        log(f"{len(failed)} call(s) FAILED and are missing; rerun to retry them:")
+        for s in failed:
+            log(f"  {s}")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        sys.exit("Usage: python moments_prototype.py STEM [STEM ...]")
-    main(sys.argv[1:])
+        sys.exit("Usage: python moments_prototype.py --all   |   python moments_prototype.py STEM [STEM ...]")
+    sys.exit(main(sys.argv[1:]))

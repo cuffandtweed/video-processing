@@ -32,41 +32,68 @@ def script_safe_json(obj):
     return json.dumps(obj, ensure_ascii=False).replace("</", "<\\/")
 
 
-def build_html(moments, topics):
+def _local_base(base):
+    """A folder as the start of a link: a Windows path becomes a file:/// address; a relative folder is kept
+    (so a page sitting next to a "videos" folder works anywhere); always ends with a slash."""
+    base = base.strip()
+    if re.match(r"^[A-Za-z]:[\\/]", base):
+        base = "file:///" + base.replace("\\", "/")
+    elif base.startswith("\\\\"):                      # a network share
+        base = "file:" + base.replace("\\", "/")
+    base = base.replace("\\", "/")
+    return base if base.endswith("/") or not base else base + "/"
+
+
+def build_links(stems, mode, base=""):
+    """{call stem: address of its recording}.
+
+    drive: a Google Drive search for the exact file name (works for anyone with access to the folder; no file
+           IDs needed, one extra click). local: the file inside a folder on the viewer's own computer. none: no links."""
+    from urllib.parse import quote
+    if mode == "drive":
+        return {s: f"https://drive.google.com/drive/search?q={quote(s + '.mp4', safe='')}" for s in stems}
+    if mode == "local":
+        root = _local_base(base)
+        return {s: f"{root}{quote(s + '.mp4', safe='')}" for s in stems}
+    return {}
+
+
+def build_html(moments, topics, links=None, link_label="Open recording"):
     calls = {}
     for item in list(moments) + list(topics):
         calls.setdefault(item["call"], call_label(item["call"]))
     clean_moments = [{**m, "why": humanize_speakers(m.get("why", "")), "quote": humanize_speakers(m.get("quote", ""))}
                      for m in moments]
     clean_topics = [{**t, "summary": humanize_speakers(t.get("summary", ""))} for t in topics]
-    data = {"moments": clean_moments, "topics": clean_topics, "calls": calls}
+    data = {"moments": clean_moments, "topics": clean_topics, "calls": calls,
+            "links": links or {}, "linkLabel": link_label}
     return _TEMPLATE.replace("__DATA__", script_safe_json(data))
 
 
-def write_html(out_dir, moments, topics):
-    """Write moments.html, and the data it was built from (moments.json, topics.json) so the page can be
-    rebuilt later, for example after a design change, without asking the model again."""
+def write_html(out_dir, moments, topics, links=None, link_label="Open recording", filename="moments.html"):
+    """Write the page, and the data it was built from (moments.json, topics.json) so the page can be
+    rebuilt later, for example for a different place the videos live, without asking the model again."""
     for name, obj in (("moments.json", moments), ("topics.json", topics)):
         with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False)
-    path = os.path.join(out_dir, "moments.html")
+    page = build_html(moments, topics, links, link_label)   # build first: a failure must not truncate an existing page
+    path = os.path.join(out_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(build_html(moments, topics))
+        f.write(page)
     return path
 
 
-def rebuild(out_dir):
-    """Rebuild moments.html from the saved moments.json and topics.json in out_dir."""
+_LABELS = {"drive": "Open in Google Drive", "local": "Open local file"}
+
+
+def rebuild(out_dir, mode="none", base="", filename="moments.html"):
+    """Rebuild a page from the saved moments.json and topics.json in out_dir, with links of the given kind."""
     with open(os.path.join(out_dir, "moments.json"), encoding="utf-8") as f:
         moments = json.load(f)
     with open(os.path.join(out_dir, "topics.json"), encoding="utf-8") as f:
         topics = json.load(f)
-    return write_html(out_dir, moments, topics)
-
-
-if __name__ == "__main__":
-    import sys
-    print(rebuild(sys.argv[1] if len(sys.argv) > 1 else "moments_proto"))
+    stems = sorted({x["call"] for x in moments} | {x["call"] for x in topics})
+    return write_html(out_dir, moments, topics, build_links(stems, mode, base), _LABELS.get(mode, "Open recording"), filename)
 
 
 _TEMPLATE = r"""<!doctype html>
@@ -93,7 +120,8 @@ _TEMPLATE = r"""<!doctype html>
   input[type=search] { flex:1 1 200px; min-width:140px; }
   .chip { font:inherit; font-size:13px; border:1px solid var(--line); background:var(--chip); color:var(--ink); border-radius:999px; padding:3px 11px; cursor:pointer; }
   .chip.off { opacity:.45; text-decoration:line-through; }
-  .btn { font:inherit; font-size:13px; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:8px; padding:5px 10px; cursor:pointer; }
+  .btn { font:inherit; font-size:13px; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:8px; padding:5px 10px; cursor:pointer; text-decoration:none; display:inline-block; }
+  a.btn.go { background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600; }
   main { max-width:880px; margin:0 auto; padding:14px 16px 60px; }
   .count { color:var(--muted); font-size:14px; margin:4px 0 12px; }
   .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px 16px; margin:0 0 12px; }
@@ -134,13 +162,15 @@ _TEMPLATE = r"""<!doctype html>
 <script>
 const D = JSON.parse(document.getElementById('data').textContent);
 const TYPES = ['emotional','disagreement','laughter','breakthrough','humor','tension','silence'];
-const state = { tab:'moments', q:'', off:new Set(), min:3, call:'', shown:60, stars:new Set(), topicQ:'' };
+const state = { tab:'moments', q:'', off:new Set(), min:4, call:'', shown:60, stars:new Set(), topicQ:'' };
 try { state.stars = new Set(JSON.parse(localStorage.getItem('picks') || '[]')); } catch (e) {}
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const pretty = stem => (D.calls[stem] || {pretty: stem}).pretty;
 const key = m => m.call + '|' + m.timestamp + '|' + m.type;
 const savePicks = () => { try { localStorage.setItem('picks', JSON.stringify([...state.stars])); } catch (e) {} };
 const dots = n => '●'.repeat(n) + '○'.repeat(5 - n);
+const openLink = stem => D.links[stem]
+  ? `<a class="btn go" href="${esc(D.links[stem])}" target="_blank" rel="noopener">${esc(D.linkLabel)}</a>` : '';
 
 function copyText(t, btn) {
   const done = () => { const o = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => btn.textContent = o, 1200); };
@@ -165,6 +195,7 @@ function momentCard(m) {
     <blockquote>${esc(m.quote)}</blockquote>
     <p class="why">${esc(m.why)} ${warn}</p>
     <div class="meta"><b>${esc(pretty(m.call))}</b><span>at <code>${esc(m.timestamp)}</code></span>
+      ${openLink(m.call)}
       <span>file <code>${esc(m.call)}.mp4</code> <button class="btn" onclick="copyText('${esc(m.call)}.mp4 @ ${esc(m.timestamp)}', this)">Copy</button></span></div>
   </article>`;
 }
@@ -184,8 +215,8 @@ function renderTopics() {
   const html = names.map(n => {
     const items = by[n].sort((a, b) => a.call.localeCompare(b.call) || String(a.start).localeCompare(String(b.start)));
     const calls = new Set(items.map(t => t.call)).size;
-    const rows = items.map(t => `<div class="mention"><p>${esc(t.summary)}</p><div class="meta"><b>${esc(pretty(t.call))}</b>
-      <span><code>${esc(t.start)}</code>–<code>${esc(t.end)}</code></span><span>file <code>${esc(t.call)}.mp4</code></span></div></div>`).join('');
+    const rows = items.map(t => `<div class="mention"><p><b>${esc(t.topic)}</b> — ${esc(t.summary)}</p><div class="meta"><b>${esc(pretty(t.call))}</b>
+      <span><code>${esc(t.start)}</code>–<code>${esc(t.end)}</code></span>${openLink(t.call)}<span>file <code>${esc(t.call)}.mp4</code></span></div></div>`).join('');
     return `<details class="topic"><summary>${esc(n)} <span class="n">${items.length} mention${items.length === 1 ? '' : 's'} in ${calls} call${calls === 1 ? '' : 's'}</span></summary>${rows}</details>`;
   }).join('');
   document.getElementById('app').innerHTML = `<p class="count">${names.length} topics</p>${html || '<p class="empty">No topics match.</p>'}`;
@@ -243,3 +274,15 @@ show('moments');
 </body>
 </html>
 """
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Rebuild the moments page from saved data, with links to the recordings.")
+    ap.add_argument("out_dir", nargs="?", default="moments_proto")
+    ap.add_argument("--links", choices=["none", "drive", "local"], default="none",
+                    help="drive = Google Drive search links; local = files in a folder on the viewer's computer")
+    ap.add_argument("--base", default="", help="for --links local: the folder holding the videos (a path, or a relative folder)")
+    ap.add_argument("--name", default="moments.html", help="file name for the page")
+    a = ap.parse_args()
+    print(rebuild(a.out_dir, a.links, a.base, a.name))

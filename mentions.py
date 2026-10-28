@@ -25,6 +25,43 @@ def person_pattern(full_name, last_name_alone=True):
     return re.compile(rf"\b{re.escape(first)}\s+{re.escape(last)}\b", re.IGNORECASE)
 
 
+def variants_pattern(variants):
+    """A compiled pattern for a list of spellings, each matched as whole words in any case.
+
+    Speech-to-text often garbles an unusual name ("Ulderico" comes out as "old Derico", "Olderrico"...), so a person
+    can be given as a list of the spellings actually found. Longer spellings win, so "old Derico" is reported whole."""
+    parts = sorted({" ".join(v.split()) for v in variants if v.strip()}, key=len, reverse=True)
+    return re.compile(r"\b(?:" + "|".join(r"\s+".join(re.escape(w) for w in v.split()) for v in parts) + r")\b",
+                      re.IGNORECASE)
+
+
+def load_aliases(path):
+    """{lowercased name: [spellings]} from a text file of lines like "Name | spelling; spelling". "#" starts a comment."""
+    aliases = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "|" not in line:
+                    continue
+                name, spellings = line.split("|", 1)
+                aliases[name.strip().lower()] = [s.strip() for s in spellings.split(";") if s.strip()]
+    except FileNotFoundError:
+        pass
+    return aliases
+
+
+def pattern_for(name, aliases=None, last_name_alone=True):
+    """The pattern to use for a name: its listed spellings if it has them; otherwise the single word as is, or
+    for a full name "First Last" (or just "Last") but never the first name alone."""
+    listed = (aliases or {}).get(name.strip().lower())
+    if listed:
+        return variants_pattern([name] + listed)
+    if len(name.split()) == 1:
+        return variants_pattern([name])
+    return person_pattern(name, last_name_alone)
+
+
 def parse_transcript(text):
     """The chapters (with start and end) and the spoken lines of a transcript .txt file."""
     chapters, spoken, section = [], [], None
@@ -61,9 +98,15 @@ def find_mentions(parsed, pattern):
     """Every place the person is named, earliest first. The overall summary is not searched: it has no timestamps."""
     hits = []
     for line in parsed["spoken"]:
+        found, seen = [], set()                     # one hit per spoken line, listing each different spelling in it
         for m in pattern.finditer(line["text"]):
+            text = re.sub(r"\s+", " ", m.group(0))
+            if text.lower() not in seen:
+                seen.add(text.lower())
+                found.append(text)
+        if found:
             hits.append({"kind": "spoken", "time": line["clock"], "end": "", "speaker": line["speaker"],
-                         "matched": re.sub(r"\s+", " ", m.group(0)), "snippet": line["text"]})
+                         "matched": " / ".join(found), "snippet": line["text"]})
     for chapter in parsed["chapters"]:
         m = pattern.search(chapter["text"])
         if m:

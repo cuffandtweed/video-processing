@@ -1,0 +1,7 @@
+# How a person's name was actually written in the transcripts, when speech-to-text garbled it.
+# One person per line:   Name | spelling; spelling; spelling
+# Spellings are matched as whole words, in any capitalization. Check them against the transcripts and edit freely.
+#
+# Ulderico is written many ways; the transcripts also call him "old Derico". NOT included on purpose:
+#   "Federico" (that is Chris Federico, a different person), and bare "erico" / "derio" / "derigo" (too short to trust).
+Ulderico | olderico; olderrico; olderricho; olderrio; olderrios; olderrigo; olderrigos; alderico; elderrio; bulderigo; derico; dericho; old derico; old dericho; old erico; old derio; old derigo; el derico; ol derico; al derico

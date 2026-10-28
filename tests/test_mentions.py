@@ -38,6 +38,54 @@ def test_person_pattern_can_require_the_full_name():
     assert not pat.search("Sweeney said so")
 
 
+def test_variants_pattern_matches_each_spelling_as_whole_words_in_any_case():
+    pat = mn.variants_pattern(["ulderico", "olderrico", "old derico", "derico"])
+    for text in ["Ulderico is here", "Olderrico just transitioned", "I saw old Derico today", "Oh Derico, hi",
+                 "Derico's contract", "OLD  DERICO"]:
+        assert pat.search(text), text
+    for text in ["Chris Federico is a contractor", "Dericoville", "nothing here", "soldering irons"]:
+        assert not pat.search(text), text
+
+
+def test_variants_pattern_prefers_the_longest_spelling_so_the_whole_phrase_is_reported():
+    pat = mn.variants_pattern(["derico", "old derico", "ulderico"])
+    assert pat.search("Marty thought old Derico was great").group(0) == "old Derico"
+
+
+def test_variants_pattern_escapes_special_characters():
+    assert mn.variants_pattern(["a.b"]).search("a.b") and not mn.variants_pattern(["a.b"]).search("axb")
+
+
+def test_load_aliases_reads_name_and_spellings_and_skips_comments_and_blank_lines(tmp_path):
+    f = tmp_path / "aliases.txt"
+    f.write_text("# a comment\n\nUlderico | olderrico; alderico ;old derico\nOther Name|x\n", encoding="utf-8")
+    assert mn.load_aliases(str(f)) == {"ulderico": ["olderrico", "alderico", "old derico"], "other name": ["x"]}
+
+
+def test_load_aliases_missing_file_gives_nothing(tmp_path):
+    assert mn.load_aliases(str(tmp_path / "nope.txt")) == {}
+
+
+def test_pattern_for_uses_aliases_when_present_and_the_plain_name_rule_otherwise():
+    aliases = {"ulderico": ["olderrico", "old derico"]}
+    pat = mn.pattern_for("Ulderico", aliases)
+    assert pat.search("old Derico said") and pat.search("Ulderico said") and not pat.search("Chris Federico")
+    two = mn.pattern_for("Ben Sweeney", aliases)                      # no aliases: the full-name or last-name rule
+    assert two.search("Sweeney said") and not two.search("Ben Shamash")
+    single = mn.pattern_for("Marty", {})                              # one word, no aliases: just that word
+    assert single.search("Marty said") and not single.search("Martyn")
+
+
+def test_a_spoken_line_with_two_spellings_counts_once_and_lists_both():
+    pat = mn.variants_pattern(["olderricho", "dericho"])
+    parsed = mn.parse_transcript("=== TRANSCRIPT ===\n[00:19:05] spk_0: Olderricho. So let's put a Dericho to the side.\n")
+    hits = mn.find_mentions(parsed, pat)
+    assert len(hits) == 1
+    assert hits[0]["matched"] == "Olderricho / Dericho"
+    same = mn.parse_transcript("=== TRANSCRIPT ===\n[00:00:01] spk_0: Derico said derico again.\n")
+    assert mn.find_mentions(same, mn.variants_pattern(["derico"]))[0]["matched"] == "Derico"   # same spelling twice: once
+
+
 def test_parse_transcript_reads_chapters_and_spoken_lines():
     p = mn.parse_transcript(SAMPLE)
     assert [c["start"] for c in p["chapters"]] == ["00:00:00", "00:03:01", "00:07:01"]

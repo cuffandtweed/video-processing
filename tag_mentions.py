@@ -14,6 +14,7 @@ Reads the transcript .txt files (reports/transcripts by default) and writes, und
 The first name alone is never matched (it is often shared by other people).
 """
 import argparse
+import collections
 import csv
 import glob
 import json
@@ -37,8 +38,10 @@ def bold_match(snippet, pattern):
     return pattern.sub(lambda m: f"**{m.group(0)}**", snippet)
 
 
-def run(name, transcripts_dir, out_dir, last_name_alone=True):
-    pattern = mn.person_pattern(name, last_name_alone)
+def run(name, transcripts_dir, out_dir, last_name_alone=True, aliases=None):
+    aliases = aliases or {}
+    pattern = mn.pattern_for(name, aliases, last_name_alone)
+    listed = aliases.get(name.strip().lower())
     by_call = {}
     for path in sorted(glob.glob(os.path.join(transcripts_dir, "2026-*.txt"))):
         stem = os.path.basename(path)[:-4]
@@ -65,10 +68,19 @@ def run(name, transcripts_dir, out_dir, last_name_alone=True):
     shown = [r for r in rows if r["kind"] == "video summary"]
     calls_spoken = {r["file"] for r in spoken}
     calls_shown = {r["file"] for r in shown}
-    rule = (f'"{name}" or the last name alone ("{name.split()[-1]}")' if last_name_alone else f'"{name}"')
+    spellings = collections.Counter(r["matched"].lower() for r in rows)
+    if listed:
+        rule = "these spellings (how speech-to-text wrote the name): " + ", ".join(f'"{s}"' for s in [name] + listed)
+        note = "Edit `name_aliases.txt` to add or remove a spelling."
+    elif len(name.split()) == 1:
+        rule, note = f'the word "{name}"', ""
+    else:
+        rule = f'"{name}" or the last name alone ("{name.split()[-1]}")' if last_name_alone else f'"{name}"'
+        note = "The first name alone is never matched."
     with open(os.path.join(folder, "mentions.md"), "w", encoding="utf-8") as f:
         f.write(f"# Mentions of {name}\n\n")
-        f.write(f"Matched exactly: {rule}, in any capitalization. The first name alone is never matched.\n\n")
+        f.write(f"Matched exactly: {rule}, in any capitalization. {note}\n\n")
+        f.write("Spellings found: " + ", ".join(f'"{s}" ×{n}' for s, n in spellings.most_common()) + "\n\n")
         f.write(f"- **{len(by_call)} calls** mention {name} at least once.\n")
         f.write(f"- **Spoken:** {len(spoken)} times in {len(calls_spoken)} calls (someone says the name; the time is that line).\n")
         f.write(f"- **In the video summary:** {len(shown)} stretches in {len(calls_shown)} calls (the AI-written description of "
@@ -92,7 +104,9 @@ if __name__ == "__main__":
     ap.add_argument("--transcripts", default=os.path.join("reports", "transcripts"))
     ap.add_argument("--out", default="mentions")
     ap.add_argument("--full-name-only", action="store_true", help="do not count hits that use only the last name")
+    ap.add_argument("--aliases", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "name_aliases.txt"),
+                    help="file listing how speech-to-text spelled a name (default: name_aliases.txt)")
     a = ap.parse_args()
-    r = run(a.name, a.transcripts, a.out, last_name_alone=not a.full_name_only)
+    r = run(a.name, a.transcripts, a.out, last_name_alone=not a.full_name_only, aliases=mn.load_aliases(a.aliases))
     print(f'{r["calls"]} calls mention {a.name}: {r["spoken"]} spoken hits in {r["calls_spoken"]} calls, '
           f'{r["on_screen"]} video-summary stretches in {r["calls_shown"]} calls. Files are in {r["folder"]}')

@@ -98,6 +98,11 @@ def run(name, transcripts_dir, out_dir, last_name_alone=True, aliases=None):
             "calls_spoken": len(calls_spoken), "calls_shown": len(calls_shown), "rows": rows}
 
 
+def tags_filename(kind):
+    """People go to people.json (the People tab); exact-phrase topics to topic_tags.json (the top of the Topics tab)."""
+    return "topic_tags.json" if kind == "topic" else "people.json"
+
+
 def save_people(path, new_people):
     """Write {name: rows} to people.json, keeping anyone already saved who is not in new_people, so rerunning one
     person never erases another. The filmmaker's page reads this file for its People tab and tags."""
@@ -120,6 +125,8 @@ if __name__ == "__main__":
     ap.add_argument("--transcripts", default=os.path.join("reports", "transcripts"))
     ap.add_argument("--out", default="mentions")
     ap.add_argument("--full-name-only", action="store_true", help="do not count hits that use only the last name")
+    ap.add_argument("--kind", choices=["person", "topic"], default="person",
+                    help="person: shown in the People tab. topic: an exact-phrase topic, shown first in the Topics tab")
     ap.add_argument("--aliases", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "name_aliases.txt"),
                     help="file listing how speech-to-text spelled a name (default: name_aliases.txt)")
     a = ap.parse_args()
@@ -130,5 +137,6 @@ if __name__ == "__main__":
         found[name] = r["rows"]
         print(f'{r["calls"]} calls mention {name}: {r["spoken"]} spoken hits in {r["calls_spoken"]} calls, '
               f'{r["on_screen"]} video-summary stretches in {r["calls_shown"]} calls. Files are in {r["folder"]}')
-    save_people(os.path.join(a.out, "people.json"), found)
-    print(f'Saved {os.path.join(a.out, "people.json")} for the filmmaker page (moments_html.py picks it up).')
+    target = os.path.join(a.out, tags_filename(a.kind))
+    save_people(target, found)
+    print(f"Saved {target} for the filmmaker page (moments_html.py picks it up).")

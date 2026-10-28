@@ -4,4 +4,7 @@
 #
 # Ulderico is written many ways; the transcripts also call him "old Derico". NOT included on purpose:
 #   "Federico" (that is Chris Federico, a different person), and bare "erico" / "derio" / "derigo" (too short to trust).
+# Topics tagged by exact phrase (run with --kind topic). The company is discussing shifting from B2B to B2C.
+B2C | b2c; b 2 c; b to c; b-to-c; business to consumer; business-to-consumer; business to consumers
+B2B | b2b; b 2 b; b to b; b-to-b; business to business; business-to-business
 Ulderico | olderico; olderrico; olderricho; olderrio; olderrios; olderrigo; olderrigos; alderico; elderrio; bulderigo; derico; dericho; old derico; old dericho; old erico; old derio; old derigo; el derico; ol derico; al derico

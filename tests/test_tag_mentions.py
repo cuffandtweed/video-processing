@@ -6,6 +6,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import tag_mentions as tm
 
 
+def test_tags_filename_depends_on_the_kind():
+    assert tm.tags_filename("person") == "people.json"
+    assert tm.tags_filename("topic") == "topic_tags.json"
+
+
 def test_save_people_creates_the_file(tmp_path):
     path = str(tmp_path / "people.json")
     tm.save_people(path, {"Ulderico": [{"time": "00:01:00"}]})

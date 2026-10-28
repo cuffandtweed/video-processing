@@ -213,7 +213,7 @@ def test_page_tags_a_moment_when_a_person_is_named_within_a_minute(tmp_path):
     far = [c for c in cards if "far away" in c][0]
     assert 'class="ptag"' in near and "Ulderico" in near          # spoken at 00:05:58, moment at 00:06:20
     assert 'class="ptag"' not in far
-    assert 'id="person"' in out["momentsBar"] and "Anyone named" in out["momentsBar"]
+    assert 'id="person"' in out["momentsBar"] and "Any person or topic" in out["momentsBar"]
 
 
 @needs_node
@@ -222,6 +222,55 @@ def test_page_without_people_has_no_person_filter_or_tags(tmp_path):
     out = _run_page(tmp_path, moments, [], None)
     assert out["tabs"] == ["moments", "topics"]
     assert 'id="person"' not in out["momentsBar"] and "ptag" not in out["moments"]
+
+
+TERM_ROWS = {"B2C": [
+    {"call": "Sep 22 · 12:00 PM · X", "file": STEM + ".mp4", "date": "2026-09-22", "time": "00:35:38", "end": "",
+     "kind": "spoken", "speaker": "Speaker 0", "matched": "B2C",
+     "snippet": "It's basically B2C because the people are small businesses."},
+]}
+
+
+def _run_page_with_terms(tmp_path, moments, people=None, terms=None):
+    import json
+    import subprocess
+    page = tmp_path / "page.html"
+    page.write_text(h.build_html(moments, [], links=h.build_links([STEM], "drive"), link_label="Open in Google Drive",
+                                 people=people, terms=terms), encoding="utf-8")
+    harness = os.path.join(os.path.dirname(os.path.abspath(__file__)), "page_harness.js")
+    done = subprocess.run([_node(), harness, str(page)], capture_output=True, text=True, encoding="utf-8")
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def test_build_html_with_only_terms_has_no_people_tab_but_embeds_the_terms():
+    page = h.build_html([], [], terms=TERM_ROWS)
+    assert 'data-tab="people"' not in page and page.count('data-tab="') == 2
+    assert "B2C" in page
+
+
+@needs_node
+def test_topics_tab_shows_tagged_topics_with_counts_highlighting_and_links(tmp_path):
+    out = _run_page_with_terms(tmp_path, [], terms=TERM_ROWS)
+    topics = out["topics"]
+    assert "Tagged topics" in topics and "B2C" in topics
+    assert "1 said in 1 call" in topics
+    assert "<mark>B2C</mark>" in topics
+    assert "Open in Google Drive" in topics
+
+
+@needs_node
+def test_a_moment_near_a_tagged_topic_gets_a_tag_and_the_filter_lists_topics_separately(tmp_path):
+    moments = [
+        {"call": STEM, "timestamp": "00:35:50", "type": "breakthrough", "score": 4, "quote": "near it", "why": "w", "source": "model", "verbatim": "yes"},
+        {"call": STEM, "timestamp": "00:10:00", "type": "breakthrough", "score": 4, "quote": "far away", "why": "w", "source": "model", "verbatim": "yes"},
+    ]
+    out = _run_page_with_terms(tmp_path, moments, people=PEOPLE_ROWS, terms=TERM_ROWS)
+    cards = out["moments"].split("<article")
+    assert 'class="ptag"' in [c for c in cards if "near it" in c][0] and "B2C" in [c for c in cards if "near it" in c][0]
+    assert 'class="ptag"' not in [c for c in cards if "far away" in c][0]
+    bar = out["momentsBar"]
+    assert 'id="person"' in bar and '<optgroup label="People">' in bar and '<optgroup label="Topics">' in bar
 
 
 def test_script_safe_json_never_contains_a_closing_script_tag():

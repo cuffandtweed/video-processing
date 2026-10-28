@@ -32,8 +32,9 @@ if (tabs.some(t => t.dataset.tab === 'people')) {
   vm.runInContext("show('people')", sandbox);
   out.people = els.app.innerHTML;
   out.peopleBar = els.bar.innerHTML;
-  vm.runInContext("show('topics')", sandbox);
-  out.topics = els.app.innerHTML;
 }
+vm.runInContext("show('topics')", sandbox);
+out.topics = els.app.innerHTML;
+out.topicsBar = els.bar.innerHTML;
 if (process.argv[3]) out.eval = vm.runInContext(process.argv[3], sandbox);   // optional: evaluate an expression in the page
 console.log(JSON.stringify(out));

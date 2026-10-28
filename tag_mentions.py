@@ -98,15 +98,37 @@ def run(name, transcripts_dir, out_dir, last_name_alone=True, aliases=None):
             "calls_spoken": len(calls_spoken), "calls_shown": len(calls_shown), "rows": rows}
 
 
+def save_people(path, new_people):
+    """Write {name: rows} to people.json, keeping anyone already saved who is not in new_people, so rerunning one
+    person never erases another. The filmmaker's page reads this file for its People tab and tags."""
+    people = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            people = json.load(f)
+    except (FileNotFoundError, ValueError):
+        pass
+    people.update(new_people)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(people, f, ensure_ascii=False)
+    return people
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("name", help='the full name to find, e.g. "Ben Sweeney"')
+    ap.add_argument("names", nargs="+", help='one or more names to find, e.g. "Ben Sweeney" "Ulderico"')
     ap.add_argument("--transcripts", default=os.path.join("reports", "transcripts"))
     ap.add_argument("--out", default="mentions")
     ap.add_argument("--full-name-only", action="store_true", help="do not count hits that use only the last name")
     ap.add_argument("--aliases", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "name_aliases.txt"),
                     help="file listing how speech-to-text spelled a name (default: name_aliases.txt)")
     a = ap.parse_args()
-    r = run(a.name, a.transcripts, a.out, last_name_alone=not a.full_name_only, aliases=mn.load_aliases(a.aliases))
-    print(f'{r["calls"]} calls mention {a.name}: {r["spoken"]} spoken hits in {r["calls_spoken"]} calls, '
-          f'{r["on_screen"]} video-summary stretches in {r["calls_shown"]} calls. Files are in {r["folder"]}')
+    aliases = mn.load_aliases(a.aliases)
+    found = {}
+    for name in a.names:
+        r = run(name, a.transcripts, a.out, last_name_alone=not a.full_name_only, aliases=aliases)
+        found[name] = r["rows"]
+        print(f'{r["calls"]} calls mention {name}: {r["spoken"]} spoken hits in {r["calls_spoken"]} calls, '
+              f'{r["on_screen"]} video-summary stretches in {r["calls_shown"]} calls. Files are in {r["folder"]}')
+    save_people(os.path.join(a.out, "people.json"), found)
+    print(f'Saved {os.path.join(a.out, "people.json")} for the filmmaker page (moments_html.py picks it up).')

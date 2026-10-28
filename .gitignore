@@ -21,3 +21,6 @@ __pycache__/
 
 # Prototype output and cached BDA data (generated)
 moments_proto/
+
+# Per-person mention tagging output (quotes from the calls)
+mentions/

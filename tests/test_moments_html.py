@@ -141,7 +141,7 @@ def test_normalize_people_keeps_only_what_the_page_needs_and_adds_the_call_stem(
     out = h.normalize_people(PEOPLE_ROWS)
     row = out["Ulderico"][0]
     assert row["stem"] == STEM
-    assert set(row) == {"stem", "time", "end", "kind", "speaker", "matched", "snippet"}
+    assert set(row) == {"stem", "time", "end", "kind", "speaker", "matched", "snippet", "note"}
 
 
 def test_build_html_without_people_has_no_people_tab():
@@ -271,6 +271,80 @@ def test_a_moment_near_a_tagged_topic_gets_a_tag_and_the_filter_lists_topics_sep
     assert 'class="ptag"' not in [c for c in cards if "far away" in c][0]
     bar = out["momentsBar"]
     assert 'id="person"' in bar and '<optgroup label="People">' in bar and '<optgroup label="Topics">' in bar
+
+
+OTHER = "2026-09-23_090000_other_call_12345678901"
+PRESENCE = {STEM: "in", OTHER: "no sign"}
+FRUSTRATION_ROWS = {"Frustration with Liz": [
+    {"call": "x", "file": OTHER + ".mp4", "date": "2026-09-23", "time": "00:01:05", "end": "", "kind": "spoken",
+     "speaker": "spk_1", "matched": "", "snippet": "she isn't giving any direction", "note": "wants direction"}]}
+
+
+def _page_eval(tmp_path, expr, moments, topics=(), presence=None, terms=None):
+    import json
+    import subprocess
+    page = tmp_path / "page.html"
+    page.write_text(h.build_html(moments, list(topics), links=h.build_links([STEM, OTHER], "drive"), presence=presence,
+                                 terms=terms), encoding="utf-8")
+    harness = os.path.join(os.path.dirname(os.path.abspath(__file__)), "page_harness.js")
+    done = subprocess.run([_node(), harness, str(page), expr], capture_output=True, text=True, encoding="utf-8")
+    assert done.returncode == 0, done.stderr
+    return json.loads(done.stdout)
+
+
+def _m(call, quote):
+    return {"call": call, "timestamp": "00:01:10", "type": "tension", "score": 4, "quote": quote, "why": "w", "source": "model", "verbatim": "yes"}
+
+
+@needs_node
+def test_page_offers_a_meetings_liz_isnt_in_filter_that_keeps_only_those_calls(tmp_path):
+    moments = [_m(STEM, "with her"), _m(OTHER, "without her")]
+    out = _page_eval(tmp_path, "state.outOnly = true; renderMoments(); document.getElementById('app').innerHTML",
+                     moments, presence=PRESENCE)
+    assert 'id="outonly"' in out["momentsBar"] and "Liz isn" in out["momentsBar"]
+    assert "without her" in out["eval"] and "with her" not in out["eval"].replace("without her", "")
+    assert "without her" in out["moments"] and "with her" in out["moments"].replace("without her", "")   # off by default
+
+
+@needs_node
+def test_moment_cards_in_calls_liz_is_out_of_carry_a_tag_and_others_do_not(tmp_path):
+    out = _page_eval(tmp_path, "0", [_m(STEM, "with her"), _m(OTHER, "without her")], presence=PRESENCE)
+    cards = out["moments"].split("<article")
+    assert "Liz not in this call" in [c for c in cards if "without her" in c][0]
+    assert "Liz not in this call" not in [c for c in cards if ">with her<" in c][0]
+
+
+@needs_node
+def test_without_presence_data_there_is_no_filter_and_no_tag(tmp_path):
+    out = _page_eval(tmp_path, "0", [_m(OTHER, "q")])
+    assert 'id="outonly"' not in out["momentsBar"] and "Liz not in" not in out["moments"]
+
+
+@needs_node
+def test_the_filter_also_applies_to_topics_and_to_tagged_topics(tmp_path):
+    topics = [{"call": STEM, "canonical": "Docs", "topic": "docs", "summary": "with", "start": "00:00:01", "end": "00:00:09"},
+              {"call": OTHER, "canonical": "Docs", "topic": "docs", "summary": "without", "start": "00:00:01", "end": "00:00:09"}]
+    out = _page_eval(tmp_path, "state.outOnly = true; renderTopics(); document.getElementById('app').innerHTML",
+                     [], topics, presence=PRESENCE, terms=FRUSTRATION_ROWS)
+    assert "<b>docs</b> — without" in out["eval"] and "<b>docs</b> — with<" not in out["eval"]
+    assert "Frustration with Liz" in out["eval"] and "she isn&#39;t giving any direction" in out["eval"]
+
+
+@needs_node
+def test_a_tagged_quote_shows_its_note_and_never_a_blank_highlight(tmp_path):
+    out = _page_eval(tmp_path, "0", [], presence=PRESENCE, terms=FRUSTRATION_ROWS)
+    assert "wants direction" in out["topics"] and "<mark></mark>" not in out["topics"]
+
+
+def test_rebuild_adds_presence_and_frustrations_from_their_saved_files(tmp_path):
+    import json
+    (tmp_path / "moments.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "topics.json").write_text("[]", encoding="utf-8")
+    (tmp_path / "pres.json").write_text(json.dumps(PRESENCE), encoding="utf-8")
+    (tmp_path / "fr.json").write_text(json.dumps(FRUSTRATION_ROWS), encoding="utf-8")
+    path = h.rebuild(str(tmp_path), presence_path=str(tmp_path / "pres.json"), frustrations_path=str(tmp_path / "fr.json"))
+    page = open(path, encoding="utf-8").read()
+    assert "no sign" in page and "she isn" in page and "Frustration with Liz" in page
 
 
 def test_script_safe_json_never_contains_a_closing_script_tag():

@@ -62,15 +62,16 @@ def normalize_people(people):
     """{name: rows} from tag_mentions, cut down to what the page needs, with each row's call stem added."""
     return {name: [{"stem": r["file"][:-4] if r["file"].endswith(".mp4") else r["file"], "time": r["time"],
                     "end": r.get("end", ""), "kind": r["kind"], "speaker": r.get("speaker", ""),
-                    "matched": r["matched"], "snippet": r["snippet"]} for r in rows]
+                    "matched": r["matched"], "snippet": r["snippet"], "note": r.get("note", "")} for r in rows]
             for name, rows in (people or {}).items()}
 
 
 _PEOPLE_TAB = '<button class="tab" data-tab="people">People</button>'
 
 
-def build_html(moments, topics, links=None, link_label="Open recording", people=None, terms=None):
-    """people: {name: rows} (the People tab). terms: {topic: rows}, exact-phrase topics shown at the top of Topics."""
+def build_html(moments, topics, links=None, link_label="Open recording", people=None, terms=None, presence=None):
+    """people: {name: rows} (the People tab). terms: {topic: rows}, tagged topics shown at the top of Topics.
+    presence: {call stem: status} from presence.py; adds the "meetings Liz isn't in" filter and tag."""
     calls = {}
     for item in list(moments) + list(topics):
         calls.setdefault(item["call"], call_label(item["call"]))
@@ -83,19 +84,20 @@ def build_html(moments, topics, links=None, link_label="Open recording", people=
                      for m in moments]
     clean_topics = [{**t, "summary": humanize_speakers(t.get("summary", ""))} for t in topics]
     data = {"moments": clean_moments, "topics": clean_topics, "calls": calls,
-            "links": links or {}, "linkLabel": link_label, "people": people, "terms": terms}
+            "links": links or {}, "linkLabel": link_label, "people": people, "terms": terms,
+            "presence": presence or {}}
     return (_TEMPLATE.replace("__PEOPLE_TAB__", _PEOPLE_TAB if people else "")
             .replace("__DATA__", script_safe_json(data)))
 
 
 def write_html(out_dir, moments, topics, links=None, link_label="Open recording", filename="moments.html", people=None,
-               terms=None):
+               terms=None, presence=None):
     """Write the page, and the data it was built from (moments.json, topics.json) so the page can be
     rebuilt later, for example for a different place the videos live, without asking the model again."""
     for name, obj in (("moments.json", moments), ("topics.json", topics)):
         with open(os.path.join(out_dir, name), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False)
-    page = build_html(moments, topics, links, link_label, people, terms)   # build first: a failure must not truncate an existing page
+    page = build_html(moments, topics, links, link_label, people, terms, presence)   # build first: a failure must not truncate an existing page
     path = os.path.join(out_dir, filename)
     with open(path, "w", encoding="utf-8") as f:
         f.write(page)
@@ -112,20 +114,27 @@ def _load_optional(path):
     return None
 
 
-def rebuild(out_dir, mode="none", base="", filename="moments.html", people_path=None, terms_path=None):
+def rebuild(out_dir, mode="none", base="", filename="moments.html", people_path=None, terms_path=None,
+            presence_path=None, frustrations_path=None):
     """Rebuild a page from the saved moments.json and topics.json in out_dir, with links of the given kind.
     people_path: the people.json written by tag_mentions.py (adds a People tab and tags).
-    terms_path:  the topic_tags.json written by `tag_mentions.py --kind topic` (adds tagged topics to the Topics tab)."""
+    terms_path:  the topic_tags.json written by `tag_mentions.py --kind topic` (adds tagged topics to the Topics tab).
+    presence_path: the liz_presence.json written by tag_presence.py (adds the "meetings Liz isn't in" filter and tag).
+    frustrations_path: the liz_frustrations.json written by frustrations.py (a tagged topic, "Frustration with Liz")."""
     with open(os.path.join(out_dir, "moments.json"), encoding="utf-8") as f:
         moments = json.load(f)
     with open(os.path.join(out_dir, "topics.json"), encoding="utf-8") as f:
         topics = json.load(f)
     people, terms = _load_optional(people_path), _load_optional(terms_path)
+    frustrations = _load_optional(frustrations_path)
+    if frustrations:
+        terms = {**(terms or {}), **frustrations}
+    presence = _load_optional(presence_path)
     stems = {x["call"] for x in moments} | {x["call"] for x in topics}
     for rows in list((people or {}).values()) + list((terms or {}).values()):
         stems |= {r["file"][:-4] for r in rows}
     return write_html(out_dir, moments, topics, build_links(sorted(stems), mode, base),
-                      _LABELS.get(mode, "Open recording"), filename, people, terms)
+                      _LABELS.get(mode, "Open recording"), filename, people, terms, presence)
 
 
 _TEMPLATE = r"""<!doctype html>
@@ -179,6 +188,8 @@ _TEMPLATE = r"""<!doctype html>
   .mention { padding:10px 16px; border-top:1px solid var(--line); }
   .mention p { margin:0 0 4px; }
   .empty { color:var(--muted); padding:30px 0; text-align:center; }
+  .out { font-size:14px; display:inline-flex; gap:6px; align-items:center; }
+  .ptag.out { color:#b45309; border-color:#b45309; }
   .ptag { font-size:12px; font-weight:600; color:var(--accent); border:1px solid var(--accent); border-radius:999px; padding:1px 9px; }
   mark { background:#fde68a; color:#1c1917; border-radius:3px; padding:0 2px; }
   details.inner { margin:0; border:0; border-top:1px solid var(--line); border-radius:0; background:transparent; }
@@ -200,7 +211,7 @@ _TEMPLATE = r"""<!doctype html>
 <script>
 const D = JSON.parse(document.getElementById('data').textContent);
 const TYPES = ['emotional','disagreement','laughter','breakthrough','humor','tension','silence'];
-const state = { tab:'moments', q:'', off:new Set(), min:4, call:'', shown:60, stars:new Set(), topicQ:'', person:'', peopleQ:'' };
+const state = { tab:'moments', q:'', off:new Set(), min:4, call:'', shown:60, stars:new Set(), topicQ:'', person:'', peopleQ:'', outOnly:false };
 try { state.stars = new Set(JSON.parse(localStorage.getItem('picks') || '[]')); } catch (e) {}
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const pretty = stem => (D.calls[stem] || {pretty: stem}).pretty;
@@ -214,6 +225,12 @@ const openLink = stem => D.links[stem]
 const PEOPLE = Object.keys(D.people || {});
 const TERMS = Object.keys(D.terms || {});          // exact-phrase topics, such as B2C
 const rowsOf = n => (D.people || {})[n] || (D.terms || {})[n] || [];
+// Meetings Liz isn't in: no sign of her in the call (see presence.py). Only offered when the page has that data.
+const HAS_PRES = Object.keys(D.presence || {}).length > 0;
+const isOut = stem => ['mentioned', 'no sign'].includes((D.presence || {})[stem]);
+const outBox = () => HAS_PRES ? `<label class="out" title="Only calls with no sign that Liz was there"><input type="checkbox" id="outonly" ${state.outOnly ? 'checked' : ''}> Meetings Liz isn't in</label>` : '';
+const outBadge = stem => isOut(stem) ? '<span class="ptag out" title="No sign of Liz in this call">Liz not in this call</span>' : '';
+const wireOut = rerender => { const b = document.getElementById('outonly'); if (b) b.onchange = e => { state.outOnly = e.target.checked; state.shown = 60; rerender(); }; };
 const secs = c => { const p = String(c).split(':').map(Number); return p.length === 3 && p.every(n => !isNaN(n)) ? p[0] * 3600 + p[1] * 60 + p[2] : NaN; };
 const spokenBy = {};
 [...PEOPLE, ...TERMS].forEach(n => rowsOf(n).forEach(r => { if (r.kind === 'spoken') (spokenBy[r.stem] = spokenBy[r.stem] || []).push({name: n, t: secs(r.time)}); }));
@@ -235,6 +252,7 @@ function matchesQ(text, q) { return !q || text.toLowerCase().includes(q.toLowerC
 
 function filteredMoments() {
   return D.moments.filter(m => m.score >= state.min && !state.off.has(m.type) && (!state.call || m.call === state.call)
+      && (!state.outOnly || isOut(m.call))
       && (!state.person || personTags(m).includes(state.person))
       && matchesQ([m.quote, m.why, pretty(m.call), m.type].join(' '), state.q))
     .sort((a, b) => b.score - a.score || a.call.localeCompare(b.call) || a.timestamp.localeCompare(b.timestamp));
@@ -244,7 +262,7 @@ function momentCard(m) {
   const starred = state.stars.has(key(m));
   const warn = m.verbatim === 'NO' ? '<span class="warn">⚠ check the wording against the recording</span>' : '';
   return `<article class="card">
-    <div class="top"><span class="tag t-${esc(m.type)}">${esc(m.type)}</span><span class="dots" title="strength ${m.score} of 5">${dots(m.score)}</span>${tagHtml(m)}
+    <div class="top"><span class="tag t-${esc(m.type)}">${esc(m.type)}</span><span class="dots" title="strength ${m.score} of 5">${dots(m.score)}</span>${tagHtml(m)}${outBadge(m.call)}
       <button class="star ${starred ? 'on' : ''}" data-key="${esc(key(m))}" title="Add to my picks">${starred ? '★' : '☆'}</button></div>
     <blockquote>${esc(m.quote)}</blockquote>
     <p class="why">${esc(m.why)} ${warn}</p>
@@ -263,7 +281,7 @@ function renderMoments() {
 
 function renderTopics() {
   const by = {};
-  D.topics.filter(t => matchesQ([t.canonical, t.topic, t.summary, pretty(t.call)].join(' '), state.topicQ))
+  D.topics.filter(t => (!state.outOnly || isOut(t.call)) && matchesQ([t.canonical, t.topic, t.summary, pretty(t.call)].join(' '), state.topicQ))
     .forEach(t => (by[t.canonical] = by[t.canonical] || []).push(t));
   const names = Object.keys(by).sort((a, b) => new Set(by[b].map(t => t.call)).size - new Set(by[a].map(t => t.call)).size || a.localeCompare(b));
   const html = names.map(n => {
@@ -275,7 +293,7 @@ function renderTopics() {
   }).join('');
   const tq = state.topicQ.toLowerCase();
   const tagged = TERMS.length
-    ? `<h2 class="sect">Tagged topics</h2><p class="count">Exact phrases, found word for word in the transcripts, including the odd spellings speech-to-text used.</p>${TERMS.map(n => taggedBlock(n, tq)).join('')}<h2 class="sect">Topics grouped by the model</h2>`
+    ? `<h2 class="sect">Tagged topics</h2><p class="count">Found in the transcripts and listed with the exact words and time. Exact-phrase topics also match the odd spellings speech-to-text used.</p>${TERMS.map(n => taggedBlock(n, tq)).join('')}<h2 class="sect">Topics grouped by the model</h2>`
     : '';
   document.getElementById('app').innerHTML = `${tagged}<p class="count">${names.length} topics</p>${html || '<p class="empty">No topics match.</p>'}`;
 }
@@ -283,13 +301,14 @@ function renderTopics() {
 function mentionRow(r) {
   const when = r.end ? `<code>${esc(r.time)}</code>–<code>${esc(r.end)}</code>` : `<code>${esc(r.time)}</code>`;
   const label = r.kind === 'spoken' ? 'said' + (r.speaker ? ' by ' + esc(r.speaker) : '') : 'in the video summary';
-  return `<div class="mention"><p>${hl(r.snippet, r.matched)}</p><div class="meta"><span>${when}</span><span class="kind">${label}</span></div></div>`;
+  const note = r.note ? `<p class="why">${esc(r.note)}</p>` : '';
+  return `<div class="mention"><p>${hl(r.snippet, r.matched)}</p>${note}<div class="meta"><span>${when}</span><span class="kind">${label}</span></div></div>`;
 }
 
 // One tagged person or topic: how often it is said, then call by call with every mention.
 function taggedBlock(name, q) {
   {
-    const rows = rowsOf(name).filter(r => !q || [name, r.snippet, pretty(r.stem)].join(' ').toLowerCase().includes(q));
+    const rows = rowsOf(name).filter(r => (!state.outOnly || isOut(r.stem)) && (!q || [name, r.snippet, pretty(r.stem)].join(' ').toLowerCase().includes(q)));
     const byCall = {};
     rows.forEach(r => (byCall[r.stem] = byCall[r.stem] || []).push(r));
     const stems = Object.keys(byCall).sort();
@@ -316,13 +335,15 @@ function renderPeople() {
 function renderBar() {
   const bar = document.getElementById('bar');
   if (state.tab === 'people') {
-    bar.innerHTML = `<input type="search" id="pq" placeholder="Search people, calls or quotes" value="${esc(state.peopleQ)}">`;
+    bar.innerHTML = `<input type="search" id="pq" placeholder="Search people, calls or quotes" value="${esc(state.peopleQ)}">${outBox()}`;
     document.getElementById('pq').oninput = e => { state.peopleQ = e.target.value; renderPeople(); };
+    wireOut(renderPeople);
     return;
   }
   if (state.tab === 'topics') {
-    bar.innerHTML = `<input type="search" id="tq" placeholder="Search topics" value="${esc(state.topicQ)}">`;
+    bar.innerHTML = `<input type="search" id="tq" placeholder="Search topics" value="${esc(state.topicQ)}">${outBox()}`;
     document.getElementById('tq').oninput = e => { state.topicQ = e.target.value; renderTopics(); };
+    wireOut(renderTopics);
     return;
   }
   const callOpts = Object.keys(D.calls).sort().map(c => `<option value="${esc(c)}" ${state.call === c ? 'selected' : ''}>${esc(pretty(c))}</option>`).join('');
@@ -332,8 +353,10 @@ function renderBar() {
     ${(PEOPLE.length || TERMS.length) ? `<select id="person" title="Only moments where this person or topic is named within a minute"><option value="">Any person or topic</option>
       ${PEOPLE.length ? `<optgroup label="People">${PEOPLE.map(n => `<option value="${esc(n)}" ${state.person === n ? 'selected' : ''}>${esc(n)}</option>`).join('')}</optgroup>` : ''}
       ${TERMS.length ? `<optgroup label="Topics">${TERMS.map(n => `<option value="${esc(n)}" ${state.person === n ? 'selected' : ''}>${esc(n)}</option>`).join('')}</optgroup>` : ''}</select>` : ''}
+    ${outBox()}
     ${TYPES.map(t => `<button class="chip ${state.off.has(t) ? 'off' : ''}" data-type="${t}">${t}</button>`).join('')}
     <button class="btn" id="dl">Download my picks</button>`;
+  wireOut(() => { renderMoments(); wire(); });
   document.getElementById('q').oninput = e => { state.q = e.target.value; state.shown = 60; renderMoments(); wire(); };
   document.getElementById('min').onchange = e => { state.min = +e.target.value; state.shown = 60; renderMoments(); wire(); };
   document.getElementById('call').onchange = e => { state.call = e.target.value; state.shown = 60; renderMoments(); wire(); };
@@ -389,5 +412,9 @@ if __name__ == "__main__":
                     help="people.json from tag_mentions.py; if it exists the page gets a People tab (default: mentions/people.json)")
     ap.add_argument("--terms", default=os.path.join("mentions", "topic_tags.json"),
                     help="topic_tags.json from tag_mentions.py --kind topic; if it exists, its topics are listed first in Topics")
+    ap.add_argument("--presence", default=os.path.join("mentions", "liz_presence.json"),
+                    help="liz_presence.json from tag_presence.py; if it exists the page gets a \"Meetings Liz isn't in\" filter")
+    ap.add_argument("--frustrations", default=os.path.join("mentions", "liz_frustrations.json"),
+                    help="liz_frustrations.json from frustrations.py; if it exists, \"Frustration with Liz\" is added to Topics")
     a = ap.parse_args()
-    print(rebuild(a.out_dir, a.links, a.base, a.name, a.people, a.terms))
+    print(rebuild(a.out_dir, a.links, a.base, a.name, a.people, a.terms, a.presence, a.frustrations))
